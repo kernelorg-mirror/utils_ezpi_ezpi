@@ -33,7 +33,7 @@ EMLPOLICY = email.policy.EmailPolicy(utf8=True, cte_type='8bit', max_line_length
 PI_HEAD = 'refs/heads/master'
 
 # My version
-__VERSION__ = '0.1'
+__VERSION__ = '0.2'
 
 
 def git_run_command(gitdir: str, args: list, stdin: Optional[bytes] = None,

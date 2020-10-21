@@ -8,14 +8,14 @@ actual public-inbox server running elsewhere.
 
 What it does:
 - provides a way to add RFC2822 messages to a git repository in a way
-  that is compatible with public-inbox
+that is compatible with public-inbox
 
 What it doesn't do:
 - anything else
 
 What it may do in the future:
 - epoch support (optionally, since we want to allow people to publish
-  these to places that only do single-level repos, like GitHub
+these to places that only do single-level repos, like GitHub
 
 For the public-inbox v2 format, see:
 - https://public-inbox.org/public-inbox-v2-format.html
