@@ -1,0 +1,99 @@
+EZPI: a simple library to write to public-inbox repos
+=====================================================
+This is a very simple library that allows writing to public-inbox v2
+repositories. Note, that this is not a suitable replacement for
+public-inbox in itself -- the goal is merely to provide a way to write
+public-inbox repositories that can be cloned, indexed and served from an
+actual public-inbox server running elsewhere.
+
+What it does:
+- provides a way to add RFC2822 messages to a git repository in a way
+  that is compatible with public-inbox
+
+What it doesn't do:
+- anything else
+
+What it may do in the future:
+- epoch support (optionally, since we want to allow people to publish
+  these to places that only do single-level repos, like GitHub
+
+For the public-inbox v2 format, see:
+- https://public-inbox.org/public-inbox-v2-format.html
+
+Requirements
+------------
+The ``git`` command must exist and be in your path.
+
+Installing
+----------
+Install from pypi::
+
+  pip install ezpi
+
+Library usage
+-------------
+This is the simplest usage example::
+
+  from email.message import EmailMessage
+  from ezpi import add_rfc822
+
+  msg = EmailMessage()
+  msg.set_content('Hello world!')
+  # We must have a Subject: and From: headers at least, in order
+  # to make a useful git commit with that data
+  msg['Subject'] = 'My excellent subject'
+  msg['From'] = 'E.X. Ample <example@example.com'>
+  # We won't create the repo for you, so run "git init --bare" first
+  add_rfc822('example.git', msg)
+
+You can also pass bytes instead of an EmailMessage object, but we must
+be able to run message_from_bytes() on it.
+
+ezpi command
+------------
+We also provide an ezpi command::
+
+    usage: main.py [-h] [-r REPO] [-d] [-q] [-v] [--rfc822] [-f HDR_FROM] [-s HDR_SUBJ] [-p]
+                   [--domain DOMAIN]
+
+    optional arguments:
+      -h, --help            show this help message and exit
+      -r REPO, --repo REPO  Bare git repository where to write the commit (must exist) (default: None)
+      -d, --dry-run         Do not write the commit, just show the commit that would be written. (default:
+                            False)
+      -q, --quiet           Only output errors to the stdout (default: False)
+      -v, --verbose         Show debugging output (default: False)
+      --rfc822              Treat stdin as an rfc822 message (default: False)
+      -f HDR_FROM, --from HDR_FROM
+                            From header for the message, if not using --rfc822 (default: None)
+      -s HDR_SUBJ, --subject HDR_SUBJ
+                            Subject header for the message, if not using --rfc822 (default: None)
+      -p, --run-post-commit-hook
+                            Run hooks/post-commit after a successful commit (if present) (default: False)
+      --domain DOMAIN       Domain to use when creating message-ids (default: None)
+
+Example::
+
+  ezpi -r path/to/example/git/0.git --rfc822 < valid.eml
+
+How to delete messages?
+-----------------------
+Since every message is a separate commit to the git repository, deleting
+requires a git history rewrite. You will need to find the commit with
+the message you want to delete and perform operations directly on the
+git repository in order to delete that commit and rebase the ones that
+follow. Once it's done, you will need to force-push the repository to
+wherever it is hosted.
+
+Caution: if anyone is replicating your repository without --mirror, the
+history rewrite will result in an error the next time they do "git
+remote update". Needless to say, they will be very interested in finding
+out what it is you just tried to delete, so use this as the last resort
+solution.
+
+Problems? Patches?
+------------------
+Email ~monsieuricon/public-inbox@lists.sr.ht
+
+(That's a different kind of public-inbox. Unfortunately, there's a name
+collision, but I believe public-inbox.org had that claimed earlier.)
