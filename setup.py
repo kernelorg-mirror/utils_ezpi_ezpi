@@ -33,7 +33,7 @@ setup(
     author_email='mricon@kernel.org',
     packages=['ezpi'],
     license='MIT-0',
-    long_description=read('README.rst'),
+    long_description=read('README'),
     long_description_content_type='text/x-rst',
     keywords=['git', 'lore.kernel.org', 'public-inbox'],
     python_requires='>=3.6',
