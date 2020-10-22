@@ -15,7 +15,7 @@ import logging
 
 from email.utils import formatdate, getaddresses, make_msgid
 
-from typing import Optional, Tuple, Dict, Union
+from typing import Optional, Tuple, Dict
 
 from email import charset
 charset.add_charset('utf-8', charset.SHORTEST)
@@ -33,14 +33,15 @@ EMLPOLICY = email.policy.EmailPolicy(utf8=True, cte_type='8bit', max_line_length
 PI_HEAD = 'refs/heads/master'
 
 # My version
-__VERSION__ = '0.2.1'
+__VERSION__ = '0.2.2'
 
 
 def git_run_command(gitdir: str, args: list, stdin: Optional[bytes] = None,
                     env: Optional[Dict] = None) -> Tuple[int, bytes, bytes]:
     if not env:
         env = dict()
-    env['GIT_DIR'] = gitdir
+    if gitdir:
+        env['GIT_DIR'] = gitdir
     args = ['git', '--no-pager'] + args
     logger.debug('Running %s', ' '.join(args))
     pp = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
@@ -99,8 +100,8 @@ def add_plaintext(repo: str, content: str, subject: str, authorname: str, author
     add_rfc822(repo, m.encode(), domain=domain)
 
 
-def add_rfc822(repo: str, content: Union[bytes, email.message.EmailMessage],
-               domain: Optional[str] = None, env: Optional[Dict] = None) -> None:
+def add_rfc822(repo: str, content, domain: Optional[str] = None,
+               env: Optional[Dict] = None) -> None:
     if isinstance(content, bytes):
         msg = email.message_from_bytes(content)
     else:
