@@ -10,6 +10,7 @@ import os
 import sys
 import ezpi
 
+from email.message import EmailMessage
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -52,24 +53,21 @@ def run_hook(feedrepo: str, fromhdr: str, domain: str):
     ll.append('operation: receive')
     ll.append(f'repo: {repo}')
     ll.append(f'user: {user}')
-    ll.append('changes:')
-    revdumps = list()
     # Do we have a push cert?
     cert = os.getenv('GIT_PUSH_CERT')
     if cert:
-        ll.append('git_push_cert:')
-        for key, val in os.environ.items():
-            if key.find('GIT_PUSH_CERT_') == 0:
-                ll.append(f'  {key.lower()}: {val}')
+        gpcstatus = os.getenv('GIT_PUSH_CERT_STATUS')
+        ll.append(f'git_push_cert_status: {gpcstatus}')
 
+    ll.append('changes:')
     while True:
         line = sys.stdin.readline()
         if not line:
             break
         oldrev, newrev, ref = line.strip().split()
-        ll.append(f'  - oldrev: {oldrev}')
-        ll.append(f'    newrev: {newrev}')
-        ll.append(f'    ref: {ref}')
+        ll.append(f'  - ref: {ref}')
+        ll.append(f'    old: {oldrev}')
+        ll.append(f'    new: {newrev}')
 
         args = ['rev-list', '--topo-order', '--no-merges', '--reverse', '--pretty=oneline', newrev]
         if set(oldrev) != {0}:
@@ -78,29 +76,32 @@ def run_hook(feedrepo: str, fromhdr: str, domain: str):
         ee, out, err = ezpi.git_run_command('', args)
         if ee > 0 or not len(out):
             continue
-        revdumps.append((oldrev, newrev, out.decode()))
-    ll.append('')
+        ll.append('    log: |')
+        for pretty in out.decode().split('\n'):
+            ll.append(f'         {pretty}')
 
-    msg = MIMEMultipart()
-    msg['From'] = fromhdr
-    msg['Subject'] = f'post-receive: {repo}'
-    msg.attach(MIMEText('\n'.join(ll), 'plain'))
-    for oldrev, newrev, revdump in revdumps:
-        filename = f'revlist-{oldrev[:12]}-{newrev[:12]}.txt'
-        att = MIMEText(revdump, 'plain')
-        att.add_header('Content-Disposition', f'attachment; filename={filename}')
-        msg.attach(att)
+    body = '\n'.join(ll) + '\n'
+
     if cert:
+        msg = MIMEMultipart()
+        msg.attach(MIMEText(body, 'plain'))
         args = ['cat-file', 'blob', cert]
         ee, out, err = ezpi.git_run_command('', args)
         if ee == 0 and out:
             att = MIMEText(out.decode(), 'plain')
             att.add_header('Content-Disposition', 'attachment; filename=git-push-certificate.txt')
             msg.attach(att)
+    else:
+        msg = EmailMessage()
+        msg.set_payload(body)
+
+    msg['From'] = fromhdr
+    msg['Subject'] = f'post-receive: {repo}'
 
     try:
         ezpi.add_rfc822(feedrepo, msg, domain)
         sys.stderr.write('Recorded in the activity feed\n')
+        ezpi.run_hook(feedrepo)
     except RuntimeError:
         # Could not add it to the feed, complain
         sys.stderr.write('FAILED writing to the activity feed!\n')

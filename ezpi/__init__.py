@@ -154,15 +154,18 @@ def add_rfc822(repo: str, content, domain: Optional[str] = None,
 
 
 def run_hook(repo: str) -> None:
-    hookpath = os.path.join(repo, 'hook', 'post-commit')
+    hookpath = os.path.join(repo, 'hooks', 'post-commit')
     if os.access(hookpath, os.X_OK):
         logger.debug('Running %s', hookpath)
-        pp = subprocess.Popen([hookpath], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        curdir = os.getcwd()
+        os.chdir(repo)
+        pp = subprocess.Popen(['hooks/post-commit'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         (output, error) = pp.communicate()
         if pp.returncode > 0:
             logger.critical('Running post-update hook failed')
             logger.critical('STDERR follows')
             logger.critical(error.decode())
+        os.chdir(curdir)
 
 
 def command() -> None:
