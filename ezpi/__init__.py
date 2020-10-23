@@ -138,7 +138,9 @@ def add_rfc822(repo: str, content, domain: Optional[str] = None,
     if not msg.get('User-Agent'):
         msg.add_header('User-Agent', f'EZPI/{__VERSION__}')
 
-    body = msg.as_bytes(policy=EMLPOLICY)
+    # we don't do as_bytes because we don't need to sent via smtp,
+    # so some of the escapes python is doing are entirely unnecessary
+    body = msg.as_string(policy=EMLPOLICY).encode()
 
     if env is None:
         env = {
