@@ -14,6 +14,7 @@ import subprocess
 import logging
 
 from email.utils import formatdate, getaddresses, make_msgid
+from fcntl import lockf, LOCK_EX, LOCK_UN
 
 from typing import Optional, Tuple, Dict
 
@@ -33,7 +34,7 @@ EMLPOLICY = email.policy.EmailPolicy(utf8=True, cte_type='8bit', max_line_length
 PI_HEAD = 'refs/heads/master'
 
 # My version
-__VERSION__ = '0.2.2'
+__VERSION__ = '0.3.0'
 
 
 def git_run_command(gitdir: str, args: list, stdin: Optional[bytes] = None,
@@ -64,6 +65,14 @@ def git_write_commit(repo: str, env: dict, c_msg: str, body: bytes, dest: str = 
     check_valid_repo(repo)
     # We use git porcelain commands here. We could use pygit2, but this would pull in a fairly
     # large external lib for what is effectively 4 commands that we need to run.
+    # Lock the repository
+    try:
+        # The lock shouldn't be held open for very long, so try without a timeout
+        lockfh = open(os.path.join(repo, 'ezpi.lock'), 'w')
+        lockf(lockfh, LOCK_EX)
+    except IOError:
+        raise RuntimeError('Could not obtain an exclusive lock')
+
     # Create a blob first
     ee, out, err = git_run_command(repo, ['hash-object', '-w', '--stdin'], stdin=body)
     if ee > 0:
@@ -91,6 +100,7 @@ def git_write_commit(repo: str, env: dict, c_msg: str, body: bytes, dest: str = 
     ee, out, err = git_run_command(repo, ['update-ref', PI_HEAD, commit])
     if ee > 0:
         raise RuntimeError(f'Could not update-ref in {repo}: {err.decode()}')
+    lockf(lockfh, LOCK_UN)
 
 
 def add_plaintext(repo: str, content: str, subject: str, authorname: str, authoremail: str,
@@ -133,10 +143,6 @@ def add_rfc822(repo: str, content, domain: Optional[str] = None,
 
     if msg.get_content_maintype() == 'text' and not msg.get_content_charset():
         msg.set_charset('utf-8')
-
-    # Sneak ourselves in as User-Agent, if not set
-    if not msg.get('User-Agent'):
-        msg.add_header('User-Agent', f'EZPI/{__VERSION__}')
 
     # we don't do as_bytes because we don't need to sent via smtp,
     # so some of the escapes python is doing are entirely unnecessary
