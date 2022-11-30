@@ -7,16 +7,19 @@
 __author__ = 'Konstantin Ryabitsev <konstantin@linuxfoundation.org>'
 
 import os
+import re
 import email
+import email.message
+import email.header
 import email.policy
 
 import subprocess
 import logging
 
-from email.utils import formatdate, getaddresses, make_msgid
+from email.utils import formatdate, make_msgid, parseaddr
 from fcntl import lockf, LOCK_EX, LOCK_UN
 
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, Union
 
 from email import charset
 charset.add_charset('utf-8', charset.SHORTEST)
@@ -34,7 +37,7 @@ EMLPOLICY = email.policy.EmailPolicy(utf8=True, cte_type='8bit', max_line_length
 PI_HEAD = 'refs/heads/master'
 
 # My version
-__VERSION__ = '0.3.0'
+__VERSION__ = '0.4.0'
 
 
 def git_run_command(gitdir: str, args: list, stdin: Optional[bytes] = None,
@@ -110,24 +113,40 @@ def add_plaintext(repo: str, content: str, subject: str, authorname: str, author
     add_rfc822(repo, m.encode(), domain=domain)
 
 
-def add_rfc822(repo: str, content, domain: Optional[str] = None,
-               env: Optional[Dict] = None) -> None:
+def clean_header(hdrval: str) -> str:
+    decoded = ''
+    for hstr, hcs in email.header.decode_header(hdrval):
+        if hcs is None:
+            hcs = 'utf-8'
+        try:
+            decoded += hstr.decode(hcs, errors='replace')
+        except LookupError:
+            # Try as utf-u
+            decoded += hstr.decode('utf-8', errors='replace')
+        except (UnicodeDecodeError, AttributeError):
+            decoded += hstr
+    new_hdrval = re.sub(r'\n?\s+', ' ', decoded)
+    return new_hdrval.strip()
+
+
+def add_rfc822(repo: str, content: Union[email.message.Message, bytes],
+               domain: Optional[str] = None, env: Optional[Dict] = None) -> None:
     if isinstance(content, bytes):
-        msg = email.message_from_bytes(content)
+        msg = email.message_from_bytes(content, policy=EMLPOLICY)
     else:
         msg = content
 
     # Make sure we have at least a From and a subject
-    h_subject = msg.get('Subject')
+    h_subject = clean_header(msg.get('Subject'))
     if not h_subject:
         raise ValueError('Message must contain a valid Subject header')
 
-    h_from = msg.get('From')
+    h_from = clean_header(msg.get('From'))
     if not h_from:
         raise ValueError('Message must contain a valid From header')
-    parts = getaddresses([h_from])
-    a_name = parts[0][0]
-    a_email = parts[0][1]
+    parts = parseaddr(h_from)
+    a_name = parts[0]
+    a_email = parts[1]
     if not a_name:
         a_name = DEFAULT_NAME
 
@@ -144,9 +163,7 @@ def add_rfc822(repo: str, content, domain: Optional[str] = None,
     if msg.get_content_maintype() == 'text' and not msg.get_content_charset():
         msg.set_charset('utf-8')
 
-    # we don't do as_bytes because we don't need to sent via smtp,
-    # so some of the escapes python is doing are entirely unnecessary
-    body = msg.as_string(policy=EMLPOLICY).encode()
+    body = msg.as_bytes(policy=EMLPOLICY)
 
     if env is None:
         env = {
@@ -240,9 +257,9 @@ def command() -> None:
         logger.critical('ERROR: Must provide -s and -f parameters for plaintext content')
         sys.exit(1)
 
-    parts = getaddresses([_args.hdr_from])
-    a_name = parts[0][0]
-    a_email = parts[0][1]
+    parts = parseaddr(_args.hdr_from)
+    a_name = parts[0]
+    a_email = parts[1]
     if not a_name:
         a_name = DEFAULT_NAME
 
