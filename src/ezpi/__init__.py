@@ -180,8 +180,17 @@ def add_rfc822(
         msg.add_header('Message-Id', msgid)
         logger.debug('Added a message-id: %s', msgid)
 
-    if msg.get_content_maintype() == 'text' and not msg.get_content_charset():
-        msg.set_charset('utf-8')
+    # Ensure text messages with non-ASCII content have proper charset set.
+    # This handles cases where external callers pass Message objects with
+    # Unicode content but incorrect/missing charset (e.g., claiming us-ascii).
+    if msg.get_content_maintype() == 'text':
+        payload = msg.get_payload()
+        if isinstance(payload, str) and not payload.isascii():
+            # Re-encode payload as UTF-8 bytes and set proper charset
+            msg.set_payload(payload.encode('utf-8'))
+            msg.set_charset('utf-8')
+        elif not msg.get_content_charset():
+            msg.set_charset('utf-8')
 
     body = msg.as_bytes(policy=EMLPOLICY)
 
