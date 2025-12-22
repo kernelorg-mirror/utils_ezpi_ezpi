@@ -253,6 +253,7 @@ def add_rfc822(
     email.message.Message object.
 
     The function automatically:
+
     - Adds Date header if missing
     - Generates Message-Id if missing
     - Fixes charset for non-ASCII content
@@ -262,9 +263,7 @@ def add_rfc822(
         repo: Path to the bare git repository.
         content: The email message as bytes or a Message object.
         domain: Optional domain for generating the Message-Id if missing.
-        env: Optional git environment variables. If not provided, defaults
-            are used for GIT_COMMITTER_* and author info is extracted from
-            the message's From header.
+        env: Optional git environment variables for the commit.
 
     Raises:
         ValueError: If the message is missing required From or Subject headers.

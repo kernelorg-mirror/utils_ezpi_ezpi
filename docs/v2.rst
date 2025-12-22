@@ -1,0 +1,127 @@
+Public-Inbox v2 Format
+======================
+
+EZPI supports the public-inbox v2 repository format, which uses multiple
+git repositories (epochs) for better scalability with large archives.
+
+Overview
+--------
+
+The v2 format addresses scalability issues with large git repositories by
+dividing messages into time-based "epochs". Each epoch is a separate bare
+git repository, and a special ``all.git`` repository provides read access
+to all epochs via git alternates.
+
+Directory Structure
+-------------------
+
+A v2 inbox has the following structure::
+
+    inbox/
+    ├── inbox.lock          # Lock file for global state
+    ├── git/
+    │   ├── 0.git           # First epoch
+    │   ├── 1.git           # Second epoch
+    │   └── ...
+    └── all.git/            # Read-only access to all epochs
+        └── objects/
+            └── info/
+                └── alternates
+
+Epoch Rotation
+--------------
+
+EZPI supports two epoch rotation modes:
+
+Size-Based (default)
+^^^^^^^^^^^^^^^^^^^^
+
+Create a new epoch when the current one exceeds 1GB::
+
+    ezpi.add_rfc822_v2('/path/to/inbox', msg, auto_epoch='size')
+
+Or via CLI::
+
+    ezpi --v2-path /path/to/inbox --auto-epoch size --rfc822 < msg.eml
+
+Annual
+^^^^^^
+
+Create a new epoch on the first write after January 1st::
+
+    ezpi.add_rfc822_v2('/path/to/inbox', msg, auto_epoch='annual')
+
+Or via CLI::
+
+    ezpi --v2-path /path/to/inbox --auto-epoch annual --rfc822 < msg.eml
+
+Python API Usage
+----------------
+
+Basic Usage
+^^^^^^^^^^^
+
+.. code-block:: python
+
+    import ezpi
+
+    # Add message to v2 inbox (creates inbox if needed)
+    ezpi.add_rfc822_v2('/path/to/inbox', msg_bytes)
+
+    # With annual rotation
+    ezpi.add_rfc822_v2('/path/to/inbox', msg_bytes, auto_epoch='annual')
+
+Manual Initialization
+^^^^^^^^^^^^^^^^^^^^^
+
+.. code-block:: python
+
+    import ezpi
+
+    # Create a new v2 inbox
+    epoch_path = ezpi.init_v2_inbox('/path/to/inbox')
+
+    # Create additional epochs manually
+    ezpi.init_epoch('/path/to/inbox', 1)
+    ezpi.init_epoch('/path/to/inbox', 2)
+
+    # Find the latest epoch
+    epoch_num, epoch_path = ezpi.get_latest_epoch('/path/to/inbox')
+
+    # Check epoch size
+    size = ezpi.get_epoch_size(epoch_path)
+
+    # Check if rotation is needed
+    if ezpi.should_rotate_epoch(epoch_path, 'size'):
+        ezpi.init_epoch('/path/to/inbox', epoch_num + 1)
+
+Locking
+-------
+
+EZPI uses ``inbox.lock`` (via ``flock(2)``) to serialize operations on
+v2 inboxes, following the public-inbox specification. Individual epoch
+writes also use per-epoch ``ezpi.lock`` files.
+
+Compatibility
+-------------
+
+EZPI creates the minimal v2 structure needed for writing messages:
+
+- ``inbox.lock`` for locking
+- ``git/*.git`` epoch repositories
+- ``all.git`` with alternates
+
+It does **not** create:
+
+- ``msgmap.sqlite3`` (message number mapping)
+- ``xap*/`` (Xapian search indexes)
+- ``over.sqlite3`` (overview database)
+
+These are created by ``public-inbox-index`` when you index the inbox
+for search and NNTP access.
+
+See Also
+--------
+
+- `public-inbox v2 format documentation <https://public-inbox.org/public-inbox-v2-format.html>`_
+- `public-inbox project <https://public-inbox.org/>`_

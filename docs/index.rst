@@ -1,0 +1,69 @@
+EZPI Documentation
+==================
+
+EZPI is a Python library for writing RFC2822 messages to public-inbox
+compatible git repositories. It provides both a Python API and a CLI tool.
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Contents:
+
+   quickstart
+   cli
+   api
+   v2
+
+Features
+--------
+
+- Write RFC2822 email messages to bare git repositories
+- Support for both bytes and ``email.message.Message`` objects
+- Automatic generation of missing headers (Date, Message-Id)
+- Proper handling of Unicode content and headers
+- Public-inbox v2 format support with automatic epoch management
+- CLI tool for integration with shell scripts
+
+Installation
+------------
+
+Install from PyPI::
+
+    pip install ezpi
+
+Or install from source::
+
+    git clone https://sr.ht/~monsieuricon/ezpi/
+    cd ezpi
+    pip install .
+
+Quick Example
+-------------
+
+.. code-block:: python
+
+    import ezpi
+
+    # Add an RFC822 message from bytes
+    with open('message.eml', 'rb') as f:
+        ezpi.add_rfc822('/path/to/repo.git', f.read())
+
+    # Add plaintext content
+    ezpi.add_plaintext(
+        '/path/to/repo.git',
+        content='Hello world',
+        subject='Test',
+        authorname='Sender',
+        authoremail='sender@example.com',
+    )
+
+License
+-------
+
+EZPI is licensed under the MIT-0 license.
+
+Indices and tables
+==================
+
+* :ref:`genindex`
+* :ref:`modindex`
+* :ref:`search`

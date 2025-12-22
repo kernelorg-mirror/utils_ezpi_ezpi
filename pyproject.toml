@@ -16,6 +16,13 @@ requires-python = ">=3.9"
 
 [project.urls]
 Homepage = "https://sr.ht/~monsieuricon/ezpi/"
+Documentation = "https://ezpi.readthedocs.io/"
+
+[project.optional-dependencies]
+docs = [
+    "sphinx>=7.0",
+    "sphinx-rtd-theme>=2.0",
+]
 
 [project.scripts]
 ezpi = "ezpi:command"
