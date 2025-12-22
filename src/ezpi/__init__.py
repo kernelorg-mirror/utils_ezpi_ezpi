@@ -1,27 +1,25 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 #
 # Copyright (C) 2020 by The Linux Foundation
 # SPDX-License-Identifier: MIT-0
 #
+from __future__ import annotations
+
 __author__ = 'Konstantin Ryabitsev <konstantin@linuxfoundation.org>'
 
+import email
+import email.header
+import email.message
+import email.policy
+import logging
 import os
 import re
-import email
-import email.message
-import email.header
-import email.policy
-
 import subprocess
-import logging
-
-from email.utils import formatdate, make_msgid, parseaddr
-from fcntl import lockf, LOCK_EX, LOCK_UN
-
-from typing import Optional, Tuple, Dict, Union
-
 from email import charset
+from email.utils import formatdate, make_msgid, parseaddr
+from fcntl import LOCK_EX, LOCK_UN, lockf
+from typing import IO
+
 charset.add_charset('utf-8', charset.SHORTEST)
 
 logger = logging.getLogger(__name__)
@@ -40,15 +38,19 @@ PI_HEAD = 'refs/heads/master'
 __VERSION__ = '0.5-dev'
 
 
-def git_run_command(gitdir: str, args: list, stdin: Optional[bytes] = None,
-                    env: Optional[Dict] = None) -> Tuple[int, bytes, bytes]:
+def git_run_command(
+    gitdir: str,
+    args: list[str],
+    stdin: bytes | None = None,
+    env: dict[str, str] | None = None,
+) -> tuple[int, bytes, bytes]:
     if not env:
-        env = dict()
+        env = {}
     if gitdir:
         env['GIT_DIR'] = gitdir
-    args = ['git', '--no-pager'] + args
-    logger.debug('Running %s', ' '.join(args))
-    pp = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    full_args = ['git', '--no-pager', *args]
+    logger.debug('Running %s', ' '.join(full_args))
+    pp = subprocess.Popen(full_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     (output, error) = pp.communicate(input=stdin)
 
     return pp.returncode, output, error
@@ -64,17 +66,18 @@ def check_valid_repo(repo: str) -> None:
             raise FileNotFoundError(f'Path is not a valid bare git repository: {repo}')
 
 
-def git_write_commit(repo: str, env: dict, c_msg: str, body: bytes, dest: str = 'm') -> None:
+def git_write_commit(repo: str, env: dict[str, str], c_msg: str, body: bytes, dest: str = 'm') -> None:
     check_valid_repo(repo)
     # We use git porcelain commands here. We could use pygit2, but this would pull in a fairly
     # large external lib for what is effectively 4 commands that we need to run.
     # Lock the repository
+    lockfh: IO[str] | None = None
     try:
         # The lock shouldn't be held open for very long, so try without a timeout
-        lockfh = open(os.path.join(repo, 'ezpi.lock'), 'w')
+        lockfh = open(os.path.join(repo, 'ezpi.lock'), 'w')  # noqa: SIM115
         lockf(lockfh, LOCK_EX)
-    except IOError:
-        raise RuntimeError('Could not obtain an exclusive lock')
+    except OSError as exc:
+        raise RuntimeError('Could not obtain an exclusive lock') from exc
 
     # Create a blob first
     ee, out, err = git_run_command(repo, ['hash-object', '-w', '--stdin'], stdin=body)
@@ -91,11 +94,11 @@ def git_write_commit(repo: str, env: dict, c_msg: str, body: bytes, dest: str = 
     # Find out if we are the first commit or not
     ee, out, err = git_run_command(repo, ['rev-parse', f'{PI_HEAD}^0'])
     if ee > 0:
-        args = ['commit-tree', '-m', c_msg, tree]
+        commit_args = ['commit-tree', '-m', c_msg, tree]
     else:
-        args = ['commit-tree', '-p', PI_HEAD, '-m', c_msg, tree]
+        commit_args = ['commit-tree', '-p', PI_HEAD, '-m', c_msg, tree]
     # Commit the tree
-    ee, out, err = git_run_command(repo, args, env=env)
+    ee, out, err = git_run_command(repo, commit_args, env=env)
     if ee > 0:
         raise RuntimeError(f'Could not commit-tree in {repo}: {err.decode()}')
     # Finally, update the ref
@@ -106,8 +109,14 @@ def git_write_commit(repo: str, env: dict, c_msg: str, body: bytes, dest: str = 
     lockf(lockfh, LOCK_UN)
 
 
-def add_plaintext(repo: str, content: str, subject: str, authorname: str, authoremail: str,
-                  domain: Optional[str] = None) -> None:
+def add_plaintext(
+    repo: str,
+    content: str,
+    subject: str,
+    authorname: str,
+    authoremail: str,
+    domain: str | None = None,
+) -> None:
     # We create a barebones rfc822 message out of any plaintext content
     m = f'From: {authorname} <{authoremail}>\nSubject: {subject}\n\n' + content
     add_rfc822(repo, m.encode(), domain=domain)
@@ -129,19 +138,30 @@ def clean_header(hdrval: str) -> str:
     return new_hdrval.strip()
 
 
-def add_rfc822(repo: str, content: Union[email.message.Message, bytes],
-               domain: Optional[str] = None, env: Optional[Dict] = None) -> None:
+def add_rfc822(
+    repo: str,
+    content: email.message.Message | bytes,
+    domain: str | None = None,
+    env: dict[str, str] | None = None,
+) -> None:
+    msg: email.message.Message
     if isinstance(content, bytes):
         msg = email.message_from_bytes(content, policy=EMLPOLICY)
     else:
         msg = content
 
     # Make sure we have at least a From and a subject
-    h_subject = clean_header(msg.get('Subject'))
+    raw_subject = msg.get('Subject')
+    if raw_subject is None:
+        raise ValueError('Message must contain a valid Subject header')
+    h_subject = clean_header(raw_subject)
     if not h_subject:
         raise ValueError('Message must contain a valid Subject header')
 
-    h_from = clean_header(msg.get('From'))
+    raw_from = msg.get('From')
+    if raw_from is None:
+        raise ValueError('Message must contain a valid From header')
+    h_from = clean_header(raw_from)
     if not h_from:
         raise ValueError('Message must contain a valid From header')
     parts = parseaddr(h_from)
@@ -194,9 +214,8 @@ def run_hook(repo: str) -> None:
 
 
 def command() -> None:
-    import sys
     import argparse
-    # noinspection PyTypeChecker
+    import sys
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )

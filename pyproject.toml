@@ -25,3 +25,15 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.dynamic]
 version = {attr = "ezpi.__VERSION__"}
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = ["SIM108"]
+
+[tool.mypy]
+strict = true
+python_version = "3.9"
