@@ -3,6 +3,37 @@
 # Copyright (C) 2020 by The Linux Foundation
 # SPDX-License-Identifier: MIT-0
 #
+"""EZPI - A library for writing RFC2822 messages to public-inbox repositories.
+
+This module provides functions to add email messages to public-inbox v2
+compatible bare git repositories. Messages can be provided as raw bytes,
+email.message.Message objects, or plaintext content.
+
+Example usage::
+
+    import ezpi
+
+    # Add an RFC822 message from bytes
+    with open('message.eml', 'rb') as f:
+        ezpi.add_rfc822('/path/to/repo.git', f.read())
+
+    # Add an RFC822 message from a Message object
+    import email.message
+    msg = email.message.EmailMessage()
+    msg['From'] = 'sender@example.com'
+    msg['Subject'] = 'Test'
+    msg.set_content('Hello world')
+    ezpi.add_rfc822('/path/to/repo.git', msg)
+
+    # Add plaintext content
+    ezpi.add_plaintext(
+        '/path/to/repo.git',
+        content='Hello world',
+        subject='Test',
+        authorname='Sender',
+        authoremail='sender@example.com',
+    )
+"""
 from __future__ import annotations
 
 __author__ = 'Konstantin Ryabitsev <konstantin@linuxfoundation.org>'
@@ -44,6 +75,17 @@ def git_run_command(
     stdin: bytes | None = None,
     env: dict[str, str] | None = None,
 ) -> tuple[int, bytes, bytes]:
+    """Run a git command and return its output.
+
+    Args:
+        gitdir: Path to the git repository (sets GIT_DIR environment variable).
+        args: List of arguments to pass to git (without 'git' itself).
+        stdin: Optional bytes to send to the command's stdin.
+        env: Optional environment variables to set for the command.
+
+    Returns:
+        A tuple of (return_code, stdout_bytes, stderr_bytes).
+    """
     if not env:
         env = {}
     if gitdir:
@@ -57,7 +99,14 @@ def git_run_command(
 
 
 def check_valid_repo(repo: str) -> None:
-    # check that it exists and has 'objects' and 'refs'
+    """Verify that a path is a valid bare git repository.
+
+    Args:
+        repo: Path to the repository to check.
+
+    Raises:
+        FileNotFoundError: If the path doesn't exist or isn't a valid bare git repo.
+    """
     if not os.path.isdir(repo):
         raise FileNotFoundError(f'Path does not exist: {repo}')
     musts = ['objects', 'refs']
@@ -67,6 +116,22 @@ def check_valid_repo(repo: str) -> None:
 
 
 def git_write_commit(repo: str, env: dict[str, str], c_msg: str, body: bytes, dest: str = 'm') -> None:
+    """Create a git commit containing a single file with the given content.
+
+    This is a low-level function that creates git objects (blob, tree, commit)
+    using git porcelain commands. The commit is made to refs/heads/master.
+
+    Args:
+        repo: Path to the bare git repository.
+        env: Environment variables for the git commit (GIT_AUTHOR_*, GIT_COMMITTER_*).
+        c_msg: The commit message (typically the email subject).
+        body: The file content to store (typically the serialized email).
+        dest: Filename for the blob in the tree (default: 'm').
+
+    Raises:
+        FileNotFoundError: If the repository path is invalid.
+        RuntimeError: If any git operation fails or lock cannot be acquired.
+    """
     check_valid_repo(repo)
     # We use git porcelain commands here. We could use pygit2, but this would pull in a fairly
     # large external lib for what is effectively 4 commands that we need to run.
@@ -117,12 +182,49 @@ def add_plaintext(
     authoremail: str,
     domain: str | None = None,
 ) -> None:
-    # We create a barebones rfc822 message out of any plaintext content
+    """Add plaintext content to the repository as an RFC822 message.
+
+    This is a convenience wrapper that creates a minimal RFC822 message
+    from plaintext content and adds it to the repository.
+
+    Args:
+        repo: Path to the bare git repository.
+        content: The plaintext message body.
+        subject: The email subject line.
+        authorname: Display name for the From header.
+        authoremail: Email address for the From header.
+        domain: Optional domain for generating the Message-Id.
+
+    Raises:
+        FileNotFoundError: If the repository path is invalid.
+        RuntimeError: If the git commit operation fails.
+
+    Example::
+
+        ezpi.add_plaintext(
+            '/path/to/repo.git',
+            content='Hello, world!',
+            subject='Greeting',
+            authorname='John Doe',
+            authoremail='john@example.com',
+        )
+    """
     m = f'From: {authorname} <{authoremail}>\nSubject: {subject}\n\n' + content
     add_rfc822(repo, m.encode(), domain=domain)
 
 
 def clean_header(hdrval: str) -> str:
+    """Decode and clean an email header value.
+
+    Handles RFC2047 encoded headers (e.g., =?utf-8?q?...?=) and normalizes
+    whitespace. Invalid encodings are handled gracefully with replacement.
+
+    Args:
+        hdrval: The raw header value to decode.
+
+    Returns:
+        The decoded and cleaned header value as a string.
+    """
     decoded = ''
     for hstr, hcs in email.header.decode_header(hdrval):
         if hcs is None:
@@ -130,7 +232,7 @@ def clean_header(hdrval: str) -> str:
         try:
             decoded += hstr.decode(hcs, errors='replace')
         except LookupError:
-            # Try as utf-u
+            # Try as utf-8
             decoded += hstr.decode('utf-8', errors='replace')
         except (UnicodeDecodeError, AttributeError):
             decoded += hstr
@@ -144,6 +246,43 @@ def add_rfc822(
     domain: str | None = None,
     env: dict[str, str] | None = None,
 ) -> None:
+    """Add an RFC822 message to the repository.
+
+    This is the main entry point for adding email messages to a public-inbox
+    repository. The message can be provided as raw bytes or as an
+    email.message.Message object.
+
+    The function automatically:
+    - Adds Date header if missing
+    - Generates Message-Id if missing
+    - Fixes charset for non-ASCII content
+    - Extracts author info from the From header
+
+    Args:
+        repo: Path to the bare git repository.
+        content: The email message as bytes or a Message object.
+        domain: Optional domain for generating the Message-Id if missing.
+        env: Optional git environment variables. If not provided, defaults
+            are used for GIT_COMMITTER_* and author info is extracted from
+            the message's From header.
+
+    Raises:
+        ValueError: If the message is missing required From or Subject headers.
+        FileNotFoundError: If the repository path is invalid.
+        RuntimeError: If the git commit operation fails.
+
+    Example::
+
+        # From bytes
+        ezpi.add_rfc822('/path/to/repo.git', email_bytes)
+
+        # From Message object
+        msg = email.message.EmailMessage()
+        msg['From'] = 'sender@example.com'
+        msg['Subject'] = 'Test'
+        msg.set_content('Hello')
+        ezpi.add_rfc822('/path/to/repo.git', msg)
+    """
     msg: email.message.Message
     if isinstance(content, bytes):
         msg = email.message_from_bytes(content, policy=EMLPOLICY)
@@ -208,6 +347,11 @@ def add_rfc822(
 
 
 def run_hook(repo: str) -> None:
+    """Run the post-commit hook if it exists and is executable.
+
+    Args:
+        repo: Path to the bare git repository.
+    """
     hookpath = os.path.join(repo, 'hooks', 'post-commit')
     if os.access(hookpath, os.X_OK):
         logger.debug('Running %s', hookpath)
@@ -216,13 +360,26 @@ def run_hook(repo: str) -> None:
         pp = subprocess.Popen(['hooks/post-commit'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         (output, error) = pp.communicate()
         if pp.returncode > 0:
-            logger.critical('Running post-update hook failed')
+            logger.critical('Running post-commit hook failed')
             logger.critical('STDERR follows')
             logger.critical(error.decode())
         os.chdir(curdir)
 
 
 def command() -> None:
+    """CLI entry point for the ezpi command.
+
+    This function is registered as the 'ezpi' console script entry point.
+    It reads message content from stdin and adds it to a git repository.
+
+    Usage examples::
+
+        # Add RFC822 message
+        ezpi -r /path/to/repo.git --rfc822 < message.eml
+
+        # Add plaintext with headers
+        ezpi -r /path/to/repo.git -f "Name <email>" -s "Subject" < content.txt
+    """
     import argparse
     import sys
     parser = argparse.ArgumentParser(
