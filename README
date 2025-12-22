@@ -15,10 +15,9 @@ What it doesn't do:
 
 - anything else
 
-What it may do in the future:
+What it also does:
 
-- epoch support (optionally, since we want to allow people to publish these to
-  places that only do single-level repos, like GitHub
+- supports public-inbox v2 format with automatic epoch management
 
 For the public-inbox v2 format, see:
 
@@ -30,7 +29,11 @@ The ``git`` command must exist and be in your path.
 
 Installing
 ----------
-Install from pypi::
+For CLI usage, install with pipx::
+
+  pipx install ezpi
+
+For library usage, install with pip::
 
   pip install ezpi
 

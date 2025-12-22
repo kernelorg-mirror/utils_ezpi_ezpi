@@ -26,7 +26,11 @@ Features
 Installation
 ------------
 
-Install from PyPI::
+For CLI usage, install with pipx::
+
+    pipx install ezpi
+
+For library usage, install with pip::
 
     pip install ezpi
 

@@ -6,7 +6,11 @@ This guide will help you get started with EZPI.
 Installation
 ------------
 
-Install EZPI using pip::
+For CLI usage, install with pipx::
+
+    pipx install ezpi
+
+For library usage, install with pip::
 
     pip install ezpi
 
