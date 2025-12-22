@@ -14,15 +14,11 @@ For library usage, install with pip::
 
     pip install ezpi
 
-Creating a Repository
----------------------
-
-EZPI writes to bare git repositories. Create one first::
-
-    git init --bare /path/to/messages.git
-
 Writing Messages
 ----------------
+
+EZPI manages public-inbox v2 repositories automatically, creating the
+directory structure and rotating epochs as needed.
 
 From Bytes
 ^^^^^^^^^^
@@ -37,7 +33,7 @@ If you have raw RFC822 message data::
     This is the message body.
     """
 
-    ezpi.add_rfc822('/path/to/messages.git', msg_bytes)
+    ezpi.add_rfc822_v2('/path/to/inbox', msg_bytes)
 
 From Message Objects
 ^^^^^^^^^^^^^^^^^^^^
@@ -52,17 +48,18 @@ Using Python's email library::
     msg['Subject'] = 'Hello World'
     msg.set_content('This is the message body.')
 
-    ezpi.add_rfc822('/path/to/messages.git', msg)
+    ezpi.add_rfc822_v2('/path/to/inbox', msg)
 
 From Plaintext
 ^^^^^^^^^^^^^^
 
-For plaintext content::
+For plaintext content, use single-repo mode (see below)::
 
     import ezpi
 
+    repo_path = '/path/to/inbox/git/0.git'
     ezpi.add_plaintext(
-        '/path/to/messages.git',
+        repo_path,
         content='This is the message body.',
         subject='Hello World',
         authorname='Sender Name',
@@ -74,28 +71,31 @@ Using the CLI
 
 EZPI provides a command-line interface::
 
-    # Add an RFC822 message
-    ezpi -r /path/to/messages.git --rfc822 < message.eml
+    # Add an RFC822 message to a v2 inbox
+    ezpi --v2-path /path/to/inbox --rfc822 < message.eml
 
-    # Add plaintext
-    echo "Message body" | ezpi -r /path/to/messages.git \
+    # Add plaintext to a v2 inbox
+    echo "Message body" | ezpi --v2-path /path/to/inbox \
         -f "Sender <sender@example.com>" \
         -s "Subject line"
 
-See :doc:`cli` for full CLI documentation.
+See :doc:`cli` for full CLI documentation and :doc:`v2` for v2 format details.
 
-Using v2 Format
----------------
+Single-Repo Mode
+----------------
 
-For public-inbox v2 format repositories with automatic epoch management::
+For scenarios where v2 epoch management is not needed (e.g., publishing to
+hosts that only support single-level repositories), you can write directly
+to a bare git repository::
+
+    git init --bare /path/to/messages.git
+
+Then use the non-v2 functions::
 
     import ezpi
 
-    # Writes to v2 inbox, creating it if needed
-    ezpi.add_rfc822_v2('/path/to/inbox', msg_bytes)
+    ezpi.add_rfc822('/path/to/messages.git', msg_bytes)
 
 Or via CLI::
 
-    ezpi --v2-path /path/to/inbox --rfc822 < message.eml
-
-See :doc:`v2` for full v2 format documentation.
+    ezpi -r /path/to/messages.git --rfc822 < message.eml
