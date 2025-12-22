@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ezpi"
+dynamic = ["version"]
+description = "A simple library to write content to public-inbox repositories"
+readme = "README"
+license = "MIT-0"
+authors = [
+    {name = "Konstantin Ryabitsev", email = "mricon@kernel.org"}
+]
+keywords = ["git", "lore.kernel.org", "public-inbox"]
+requires-python = ">=3.9"
+
+[project.urls]
+Homepage = "https://sr.ht/~monsieuricon/ezpi/"
+
+[project.scripts]
+ezpi = "ezpi:command"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.dynamic]
+version = {attr = "ezpi.__VERSION__"}
