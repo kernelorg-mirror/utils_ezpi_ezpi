@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "ezpi"
 dynamic = ["version"]
 description = "A simple library to write content to public-inbox repositories"
-readme = "README"
+readme = {file = "README", content-type = "text/x-rst"}
 license = "MIT-0"
 authors = [
     {name = "Konstantin Ryabitsev", email = "mricon@kernel.org"}
