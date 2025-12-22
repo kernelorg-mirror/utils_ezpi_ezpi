@@ -6,16 +6,17 @@
 """EZPI - A library for writing RFC2822 messages to public-inbox repositories.
 
 This module provides functions to add email messages to public-inbox v2
-compatible bare git repositories. Messages can be provided as raw bytes,
-email.message.Message objects, or plaintext content.
+format repositories. Messages can be provided as raw bytes or
+email.message.Message objects. The v2 inbox structure is created
+automatically and epochs are rotated based on size or annual boundaries.
 
 Example usage::
 
     import ezpi
 
-    # Add an RFC822 message from bytes
+    # Add an RFC822 message from bytes (creates inbox if needed)
     with open('message.eml', 'rb') as f:
-        ezpi.add_rfc822('/path/to/repo.git', f.read())
+        ezpi.add_rfc822_v2('/path/to/inbox', f.read())
 
     # Add an RFC822 message from a Message object
     import email.message
@@ -23,16 +24,10 @@ Example usage::
     msg['From'] = 'sender@example.com'
     msg['Subject'] = 'Test'
     msg.set_content('Hello world')
-    ezpi.add_rfc822('/path/to/repo.git', msg)
+    ezpi.add_rfc822_v2('/path/to/inbox', msg)
 
-    # Add plaintext content
-    ezpi.add_plaintext(
-        '/path/to/repo.git',
-        content='Hello world',
-        subject='Test',
-        authorname='Sender',
-        authoremail='sender@example.com',
-    )
+    # Use annual epoch rotation (new epoch each January)
+    ezpi.add_rfc822_v2('/path/to/inbox', msg, auto_epoch='annual')
 """
 from __future__ import annotations
 
