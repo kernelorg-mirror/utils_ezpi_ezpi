@@ -1,10 +1,34 @@
 """Shared pytest fixtures and helpers for ezpi tests."""
 from __future__ import annotations
 
+import os
 import subprocess
+from collections.abc import Generator
 from pathlib import Path
 
 import pytest
+
+import ezpi
+
+
+@pytest.fixture(params=["pygit2", "subprocess"], autouse=True)
+def git_backend(request: pytest.FixtureRequest) -> Generator[str, None, None]:
+    """Run each test with both git backends."""
+    backend = request.param
+    if backend == "subprocess":
+        os.environ["EZPI_USE_GIT_SUBPROCESS"] = "1"
+    elif "EZPI_USE_GIT_SUBPROCESS" in os.environ:
+        del os.environ["EZPI_USE_GIT_SUBPROCESS"]
+
+    # Skip pygit2 tests if pygit2 is not available
+    if backend == "pygit2" and not ezpi.HAS_PYGIT2:
+        pytest.skip("pygit2 not available")
+
+    yield backend
+
+    # Clean up
+    if "EZPI_USE_GIT_SUBPROCESS" in os.environ:
+        del os.environ["EZPI_USE_GIT_SUBPROCESS"]
 
 
 @pytest.fixture

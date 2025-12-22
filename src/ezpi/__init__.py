@@ -46,10 +46,19 @@ import logging
 import os
 import re
 import subprocess
+from collections.abc import Sequence
 from email import charset
 from email.utils import formatdate, make_msgid, parseaddr
 from fcntl import LOCK_EX, LOCK_UN, lockf
 from typing import IO
+
+# Optional pygit2 support
+try:
+    import pygit2
+    HAS_PYGIT2 = True
+except ImportError:
+    pygit2 = None  # type: ignore[assignment]
+    HAS_PYGIT2 = False
 
 charset.add_charset('utf-8', charset.SHORTEST)
 
@@ -67,6 +76,17 @@ PI_HEAD = 'refs/heads/master'
 
 # My version
 __VERSION__ = '0.5-dev'
+
+
+def _use_pygit2() -> bool:
+    """Check if pygit2 should be used for git operations.
+
+    Returns True if pygit2 is available and not disabled via environment
+    variable EZPI_USE_GIT_SUBPROCESS=1.
+    """
+    if not HAS_PYGIT2:
+        return False
+    return os.environ.get('EZPI_USE_GIT_SUBPROCESS', '') != '1'
 
 
 def git_run_command(
@@ -98,6 +118,89 @@ def git_run_command(
     return pp.returncode, output, error
 
 
+def _pygit2_init_repo(path: str) -> None:
+    """Initialize a bare git repository using pygit2.
+
+    Args:
+        path: Path where the bare repository should be created.
+    """
+    pygit2.init_repository(path, bare=True)
+    logger.debug('Initialized bare repo at %s (pygit2)', path)
+
+
+def _pygit2_write_commit(repo: str, env: dict[str, str], c_msg: str, body: bytes, dest: str = 'm') -> None:
+    """Create a git commit using pygit2.
+
+    Args:
+        repo: Path to the bare git repository.
+        env: Environment variables for the git commit (GIT_AUTHOR_*, GIT_COMMITTER_*).
+        c_msg: The commit message.
+        body: The file content to store.
+        dest: Filename for the blob in the tree.
+    """
+    repository = pygit2.Repository(repo)
+
+    # Create blob
+    blob_id = repository.create_blob(body)
+
+    # Build tree
+    tb = repository.TreeBuilder()
+    tb.insert(dest, blob_id, 0o100644)  # GIT_FILEMODE_BLOB
+    tree_id = tb.write()
+
+    # Create signatures
+    author = pygit2.Signature(
+        env.get('GIT_AUTHOR_NAME', DEFAULT_NAME),
+        env.get('GIT_AUTHOR_EMAIL', DEFAULT_ADDR),
+    )
+    committer = pygit2.Signature(
+        env.get('GIT_COMMITTER_NAME', DEFAULT_NAME),
+        env.get('GIT_COMMITTER_EMAIL', DEFAULT_ADDR),
+    )
+
+    # Get parent commit if exists
+    parents: Sequence[str] = []
+    try:
+        ref = repository.references.get(PI_HEAD)  # type: ignore[attr-defined]
+        if ref is not None:
+            parents = [str(ref.target)]
+    except KeyError:
+        pass
+
+    # Create commit
+    commit_id = repository.create_commit(
+        PI_HEAD,
+        author,
+        committer,
+        c_msg,
+        tree_id,
+        parents,  # type: ignore[arg-type]
+    )
+    logger.debug('Created commit %s (pygit2)', commit_id)
+
+
+def _pygit2_get_latest_commit_time(repo_path: str) -> int | None:
+    """Get the timestamp of the latest commit using pygit2.
+
+    Args:
+        repo_path: Path to the bare git repository.
+
+    Returns:
+        Unix timestamp of the latest commit, or None if no commits exist.
+    """
+    try:
+        repository = pygit2.Repository(repo_path)
+        ref = repository.references.get(PI_HEAD)  # type: ignore[attr-defined]
+        if ref is None:
+            return None
+        commit = repository.get(ref.target)  # type: ignore[attr-defined]
+        if commit is None:
+            return None
+        return int(commit.commit_time)
+    except (KeyError, pygit2.GitError):
+        return None
+
+
 def check_valid_repo(repo: str) -> None:
     """Verify that a path is a valid bare git repository.
 
@@ -118,8 +221,9 @@ def check_valid_repo(repo: str) -> None:
 def git_write_commit(repo: str, env: dict[str, str], c_msg: str, body: bytes, dest: str = 'm') -> None:
     """Create a git commit containing a single file with the given content.
 
-    This is a low-level function that creates git objects (blob, tree, commit)
-    using git porcelain commands. The commit is made to refs/heads/master.
+    This is a low-level function that creates git objects (blob, tree, commit).
+    Uses pygit2 when available, otherwise falls back to git subprocess commands.
+    The commit is made to refs/heads/master.
 
     Args:
         repo: Path to the bare git repository.
@@ -133,8 +237,6 @@ def git_write_commit(repo: str, env: dict[str, str], c_msg: str, body: bytes, de
         RuntimeError: If any git operation fails or lock cannot be acquired.
     """
     check_valid_repo(repo)
-    # We use git porcelain commands here. We could use pygit2, but this would pull in a fairly
-    # large external lib for what is effectively 4 commands that we need to run.
     # Lock the repository
     lockfh: IO[str] | None = None
     try:
@@ -144,34 +246,39 @@ def git_write_commit(repo: str, env: dict[str, str], c_msg: str, body: bytes, de
     except OSError as exc:
         raise RuntimeError('Could not obtain an exclusive lock') from exc
 
-    # Create a blob first
-    ee, out, err = git_run_command(repo, ['hash-object', '-w', '--stdin'], stdin=body)
-    if ee > 0:
-        raise RuntimeError(f'Could not create a blob in {repo}: {err.decode()}')
-    blob = out.strip(b'\n')
-    # Create a tree object now
-    treeline = b'100644 blob ' + blob + b'\t' + dest.encode()
-    # Now mktree
-    ee, out, err = git_run_command(repo, ['mktree'], stdin=treeline)
-    if ee > 0:
-        raise RuntimeError(f'Could not mktree in {repo}: {err.decode()}')
-    tree = out.decode().strip()
-    # Find out if we are the first commit or not
-    ee, out, err = git_run_command(repo, ['rev-parse', f'{PI_HEAD}^0'])
-    if ee > 0:
-        commit_args = ['commit-tree', '-m', c_msg, tree]
-    else:
-        commit_args = ['commit-tree', '-p', PI_HEAD, '-m', c_msg, tree]
-    # Commit the tree
-    ee, out, err = git_run_command(repo, commit_args, env=env)
-    if ee > 0:
-        raise RuntimeError(f'Could not commit-tree in {repo}: {err.decode()}')
-    # Finally, update the ref
-    commit = out.decode().strip()
-    ee, out, err = git_run_command(repo, ['update-ref', PI_HEAD, commit])
-    if ee > 0:
-        raise RuntimeError(f'Could not update-ref in {repo}: {err.decode()}')
-    lockf(lockfh, LOCK_UN)
+    try:
+        if _use_pygit2():
+            _pygit2_write_commit(repo, env, c_msg, body, dest)
+        else:
+            # Create a blob first
+            ee, out, err = git_run_command(repo, ['hash-object', '-w', '--stdin'], stdin=body)
+            if ee > 0:
+                raise RuntimeError(f'Could not create a blob in {repo}: {err.decode()}')
+            blob = out.strip(b'\n')
+            # Create a tree object now
+            treeline = b'100644 blob ' + blob + b'\t' + dest.encode()
+            # Now mktree
+            ee, out, err = git_run_command(repo, ['mktree'], stdin=treeline)
+            if ee > 0:
+                raise RuntimeError(f'Could not mktree in {repo}: {err.decode()}')
+            tree = out.decode().strip()
+            # Find out if we are the first commit or not
+            ee, out, err = git_run_command(repo, ['rev-parse', f'{PI_HEAD}^0'])
+            if ee > 0:
+                commit_args = ['commit-tree', '-m', c_msg, tree]
+            else:
+                commit_args = ['commit-tree', '-p', PI_HEAD, '-m', c_msg, tree]
+            # Commit the tree
+            ee, out, err = git_run_command(repo, commit_args, env=env)
+            if ee > 0:
+                raise RuntimeError(f'Could not commit-tree in {repo}: {err.decode()}')
+            # Finally, update the ref
+            commit = out.decode().strip()
+            ee, out, err = git_run_command(repo, ['update-ref', PI_HEAD, commit])
+            if ee > 0:
+                raise RuntimeError(f'Could not update-ref in {repo}: {err.decode()}')
+    finally:
+        lockf(lockfh, LOCK_UN)
 
 
 def add_plaintext(
@@ -386,9 +493,12 @@ def init_epoch(v2path: str, epoch: int) -> str:
         RuntimeError: If git init fails.
     """
     epoch_path = os.path.join(v2path, 'git', f'{epoch}.git')
-    ee, out, err = git_run_command('', ['init', '--bare', epoch_path])
-    if ee > 0:
-        raise RuntimeError(f'Could not init epoch {epoch}: {err.decode()}')
+    if _use_pygit2():
+        _pygit2_init_repo(epoch_path)
+    else:
+        ee, out, err = git_run_command('', ['init', '--bare', epoch_path])
+        if ee > 0:
+            raise RuntimeError(f'Could not init epoch {epoch}: {err.decode()}')
 
     # Update all.git/objects/info/alternates
     all_git = os.path.join(v2path, 'all.git')
@@ -444,9 +554,12 @@ def init_v2_inbox(v2path: str) -> str:
 
     # Create all.git as empty bare repo
     all_git = os.path.join(v2path, 'all.git')
-    ee, out, err = git_run_command('', ['init', '--bare', all_git])
-    if ee > 0:
-        raise RuntimeError(f'Could not init all.git: {err.decode()}')
+    if _use_pygit2():
+        _pygit2_init_repo(all_git)
+    else:
+        ee, out, err = git_run_command('', ['init', '--bare', all_git])
+        if ee > 0:
+            raise RuntimeError(f'Could not init all.git: {err.decode()}')
 
     # Create first epoch (this also sets up alternates)
     epoch_path = init_epoch(v2path, 0)
@@ -539,12 +652,20 @@ def should_rotate_epoch(epoch_path: str, mode: str) -> bool:
     if mode == 'annual':
         # Check if latest commit is from a previous year
         import datetime
-        ee, out, err = git_run_command(epoch_path, ['log', '-1', '--format=%ct', PI_HEAD])
-        if ee > 0:
-            # No commits yet, no rotation needed
-            return False
+        if _use_pygit2():
+            timestamp = _pygit2_get_latest_commit_time(epoch_path)
+            if timestamp is None:
+                return False
+        else:
+            ee, out, err = git_run_command(epoch_path, ['log', '-1', '--format=%ct', PI_HEAD])
+            if ee > 0:
+                # No commits yet, no rotation needed
+                return False
+            try:
+                timestamp = int(out.decode().strip())
+            except (ValueError, OSError):
+                return False
         try:
-            timestamp = int(out.decode().strip())
             commit_year = datetime.datetime.fromtimestamp(timestamp).year
             current_year = datetime.datetime.now().year
             return commit_year < current_year

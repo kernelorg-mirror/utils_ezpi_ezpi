@@ -23,6 +23,9 @@ docs = [
     "sphinx>=7.0",
     "sphinx-rtd-theme>=2.0",
 ]
+libgit2 = [
+    "pygit2>=1.12",
+]
 
 [project.scripts]
 ezpi = "ezpi:command"
