@@ -366,6 +366,257 @@ def run_hook(repo: str) -> None:
         os.chdir(curdir)
 
 
+# v2 format constants
+V2_SIZE_THRESHOLD = 1024 * 1024 * 1024  # 1GB
+
+
+def init_epoch(v2path: str, epoch: int) -> str:
+    """Create a new epoch repository in a v2 inbox.
+
+    Creates a bare git repository at v2path/git/{epoch}.git and updates
+    the alternates file in all.git to include the new epoch.
+
+    Args:
+        v2path: Path to the v2 inbox directory.
+        epoch: Epoch number (0-based integer).
+
+    Returns:
+        Path to the newly created epoch repository.
+
+    Raises:
+        RuntimeError: If git init fails.
+    """
+    epoch_path = os.path.join(v2path, 'git', f'{epoch}.git')
+    ee, out, err = git_run_command('', ['init', '--bare', epoch_path])
+    if ee > 0:
+        raise RuntimeError(f'Could not init epoch {epoch}: {err.decode()}')
+
+    # Update all.git/objects/info/alternates
+    all_git = os.path.join(v2path, 'all.git')
+    alternates_dir = os.path.join(all_git, 'objects', 'info')
+    alternates_file = os.path.join(alternates_dir, 'alternates')
+
+    # Read existing alternates if present
+    existing_lines: list[str] = []
+    if os.path.exists(alternates_file):
+        with open(alternates_file) as f:
+            existing_lines = [line.strip() for line in f if line.strip()]
+
+    # Add new epoch's objects directory (relative path from all.git/objects)
+    new_entry = f'../../git/{epoch}.git/objects'
+    if new_entry not in existing_lines:
+        existing_lines.append(new_entry)
+        os.makedirs(alternates_dir, exist_ok=True)
+        with open(alternates_file, 'w') as f:
+            f.write('\n'.join(existing_lines) + '\n')
+
+    logger.debug('Created epoch %d at %s', epoch, epoch_path)
+    return epoch_path
+
+
+def init_v2_inbox(v2path: str) -> str:
+    """Initialize a new public-inbox v2 format inbox.
+
+    Creates the v2 directory structure including:
+    - inbox.lock file for global locking
+    - git/ directory for epoch repositories
+    - git/0.git as the first epoch
+    - all.git/ as read-only endpoint with alternates
+
+    Args:
+        v2path: Path where the v2 inbox should be created.
+
+    Returns:
+        Path to the first epoch repository (git/0.git).
+
+    Raises:
+        RuntimeError: If any git operation fails.
+        FileExistsError: If v2path already exists.
+    """
+    if os.path.exists(v2path):
+        raise FileExistsError(f'Path already exists: {v2path}')
+
+    # Create directory structure
+    os.makedirs(v2path)
+    os.makedirs(os.path.join(v2path, 'git'))
+
+    # Create inbox.lock
+    open(os.path.join(v2path, 'inbox.lock'), 'w').close()
+
+    # Create all.git as empty bare repo
+    all_git = os.path.join(v2path, 'all.git')
+    ee, out, err = git_run_command('', ['init', '--bare', all_git])
+    if ee > 0:
+        raise RuntimeError(f'Could not init all.git: {err.decode()}')
+
+    # Create first epoch (this also sets up alternates)
+    epoch_path = init_epoch(v2path, 0)
+
+    logger.info('Initialized v2 inbox at %s', v2path)
+    return epoch_path
+
+
+def get_latest_epoch(v2path: str) -> tuple[int, str]:
+    """Find the highest numbered epoch in a v2 inbox.
+
+    Args:
+        v2path: Path to the v2 inbox directory.
+
+    Returns:
+        Tuple of (epoch_number, epoch_path).
+
+    Raises:
+        FileNotFoundError: If no epochs exist.
+    """
+    git_dir = os.path.join(v2path, 'git')
+    if not os.path.isdir(git_dir):
+        raise FileNotFoundError(f'No git directory in v2 inbox: {v2path}')
+
+    max_epoch = -1
+    for entry in os.listdir(git_dir):
+        if entry.endswith('.git'):
+            try:
+                epoch_num = int(entry[:-4])
+                if epoch_num > max_epoch:
+                    max_epoch = epoch_num
+            except ValueError:
+                continue
+
+    if max_epoch < 0:
+        raise FileNotFoundError(f'No epochs found in v2 inbox: {v2path}')
+
+    epoch_path = os.path.join(git_dir, f'{max_epoch}.git')
+    return max_epoch, epoch_path
+
+
+def get_epoch_size(epoch_path: str) -> int:
+    """Calculate the total size of a git epoch repository.
+
+    Sums the size of pack files and loose objects.
+
+    Args:
+        epoch_path: Path to the epoch bare git repository.
+
+    Returns:
+        Total size in bytes.
+    """
+    total_size = 0
+    objects_dir = os.path.join(epoch_path, 'objects')
+
+    if not os.path.isdir(objects_dir):
+        return 0
+
+    # Sum pack files
+    pack_dir = os.path.join(objects_dir, 'pack')
+    if os.path.isdir(pack_dir):
+        for entry in os.listdir(pack_dir):
+            if entry.endswith('.pack'):
+                total_size += os.path.getsize(os.path.join(pack_dir, entry))
+
+    # Sum loose objects (two-character directories)
+    for entry in os.listdir(objects_dir):
+        if len(entry) == 2 and entry not in ('info', 'pack'):
+            subdir = os.path.join(objects_dir, entry)
+            if os.path.isdir(subdir):
+                for obj in os.listdir(subdir):
+                    total_size += os.path.getsize(os.path.join(subdir, obj))
+
+    return total_size
+
+
+def should_rotate_epoch(epoch_path: str, mode: str) -> bool:
+    """Check if a new epoch should be created.
+
+    Args:
+        epoch_path: Path to the current epoch repository.
+        mode: Rotation mode - 'size' or 'annual'.
+
+    Returns:
+        True if a new epoch should be created.
+    """
+    if mode == 'size':
+        return get_epoch_size(epoch_path) >= V2_SIZE_THRESHOLD
+
+    if mode == 'annual':
+        # Check if latest commit is from a previous year
+        import datetime
+        ee, out, err = git_run_command(epoch_path, ['log', '-1', '--format=%ct', PI_HEAD])
+        if ee > 0:
+            # No commits yet, no rotation needed
+            return False
+        try:
+            timestamp = int(out.decode().strip())
+            commit_year = datetime.datetime.fromtimestamp(timestamp).year
+            current_year = datetime.datetime.now().year
+            return commit_year < current_year
+        except (ValueError, OSError):
+            return False
+
+    return False
+
+
+def add_rfc822_v2(
+    v2path: str,
+    content: email.message.Message | bytes,
+    domain: str | None = None,
+    env: dict[str, str] | None = None,
+    auto_epoch: str = 'size',
+) -> None:
+    """Add an RFC822 message to a public-inbox v2 format repository.
+
+    This function manages the v2 inbox structure, creating it if necessary
+    and handling epoch rotation based on the specified mode.
+
+    Args:
+        v2path: Path to the v2 inbox directory.
+        content: The email message as bytes or a Message object.
+        domain: Optional domain for generating the Message-Id if missing.
+        env: Optional git environment variables.
+        auto_epoch: Epoch rotation mode - 'size' (default) or 'annual'.
+
+    Raises:
+        ValueError: If the message is missing required headers.
+        RuntimeError: If any git operation fails or lock cannot be acquired.
+
+    Example::
+
+        ezpi.add_rfc822_v2('/path/to/inbox', email_bytes)
+        ezpi.add_rfc822_v2('/path/to/inbox', msg, auto_epoch='annual')
+    """
+    # Lock the inbox
+    lockfh: IO[str] | None = None
+    try:
+        if os.path.exists(v2path):
+            lockfh = open(os.path.join(v2path, 'inbox.lock'), 'w')  # noqa: SIM115
+            lockf(lockfh, LOCK_EX)
+    except OSError as exc:
+        raise RuntimeError('Could not obtain v2 inbox lock') from exc
+
+    try:
+        # Initialize if needed
+        if not os.path.exists(v2path):
+            epoch_path = init_v2_inbox(v2path)
+            # Re-acquire lock after init
+            lockfh = open(os.path.join(v2path, 'inbox.lock'), 'w')  # noqa: SIM115
+            lockf(lockfh, LOCK_EX)
+        else:
+            epoch_num, epoch_path = get_latest_epoch(v2path)
+
+            # Check if rotation is needed
+            if should_rotate_epoch(epoch_path, auto_epoch):
+                new_epoch = epoch_num + 1
+                epoch_path = init_epoch(v2path, new_epoch)
+                logger.info('Rotated to new epoch %d', new_epoch)
+
+        # Write to the epoch
+        add_rfc822(epoch_path, content, domain=domain, env=env)
+
+    finally:
+        if lockfh:
+            lockf(lockfh, LOCK_UN)
+            lockfh.close()
+
+
 def command() -> None:
     """CLI entry point for the ezpi command.
 
@@ -374,19 +625,30 @@ def command() -> None:
 
     Usage examples::
 
-        # Add RFC822 message
+        # Add RFC822 message to bare repo
         ezpi -r /path/to/repo.git --rfc822 < message.eml
 
-        # Add plaintext with headers
+        # Add plaintext with headers to bare repo
         ezpi -r /path/to/repo.git -f "Name <email>" -s "Subject" < content.txt
+
+        # Add to v2 inbox (auto-creates if needed)
+        ezpi --v2-path /path/to/inbox --rfc822 < message.eml
+
+        # Add to v2 with annual epoch rotation
+        ezpi --v2-path /path/to/inbox --auto-epoch annual --rfc822 < message.eml
     """
     import argparse
     import sys
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument('-r', '--repo', default=None,
-                        help='Bare git repository where to write the commit (must exist)')
+    repo_group = parser.add_mutually_exclusive_group(required=True)
+    repo_group.add_argument('-r', '--repo', default=None,
+                            help='Bare git repository where to write the commit (must exist)')
+    repo_group.add_argument('--v2-path', dest='v2path', default=None,
+                            help='Path to public-inbox v2 format inbox')
+    parser.add_argument('--auto-epoch', dest='auto_epoch', choices=['size', 'annual'], default=None,
+                        help='Epoch rotation mode for v2 format: size (1GB, default) or annual (Jan 1)')
     parser.add_argument('-d', '--dry-run', dest='dryrun', action='store_true', default=False,
                         help='Do not write the commit, just show the commit that would be written.')
     parser.add_argument('-q', '--quiet', action='store_true', default=False,
@@ -420,6 +682,16 @@ def command() -> None:
         ch.setLevel(logging.INFO)
 
     logger.addHandler(ch)
+
+    # Validate --auto-epoch is only used with --v2-path
+    if _args.auto_epoch and not _args.v2path:
+        logger.critical('ERROR: --auto-epoch can only be used with --v2-path')
+        sys.exit(1)
+
+    # Default auto_epoch to 'size' for v2 paths
+    if _args.v2path and not _args.auto_epoch:
+        _args.auto_epoch = 'size'
+
     if sys.stdin.isatty():
         logger.critical('ERROR: Provide the message contents on stdin')
         sys.exit(1)
@@ -430,11 +702,14 @@ def command() -> None:
             sys.exit(1)
         try:
             content = sys.stdin.buffer.read()
-            add_rfc822(_args.repo, content, domain=_args.domain)
-        except (ValueError, RuntimeError) as ex:
+            if _args.v2path:
+                add_rfc822_v2(_args.v2path, content, domain=_args.domain, auto_epoch=_args.auto_epoch)
+            else:
+                add_rfc822(_args.repo, content, domain=_args.domain)
+        except (ValueError, RuntimeError, FileExistsError) as ex:
             logger.critical('ERROR: %s', ex)
             sys.exit(1)
-        if _args.runhook:
+        if _args.runhook and _args.repo:
             run_hook(_args.repo)
         return
 
@@ -449,13 +724,18 @@ def command() -> None:
         a_name = DEFAULT_NAME
 
     try:
-        content = sys.stdin.read()
-        add_plaintext(_args.repo, content, _args.hdr_subj, a_name, a_email, domain=_args.domain)
-    except (ValueError, RuntimeError) as ex:
+        content_str = sys.stdin.read()
+        if _args.v2path:
+            # Build RFC822 message from plaintext for v2
+            m = f'From: {a_name} <{a_email}>\nSubject: {_args.hdr_subj}\n\n' + content_str
+            add_rfc822_v2(_args.v2path, m.encode(), domain=_args.domain, auto_epoch=_args.auto_epoch)
+        else:
+            add_plaintext(_args.repo, content_str, _args.hdr_subj, a_name, a_email, domain=_args.domain)
+    except (ValueError, RuntimeError, FileExistsError) as ex:
         logger.critical('ERROR: %s', ex)
         sys.exit(1)
 
-    if _args.runhook:
+    if _args.runhook and _args.repo:
         run_hook(_args.repo)
 
 
