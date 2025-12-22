@@ -8,16 +8,12 @@ actual public-inbox server running elsewhere.
 
 What it does:
 
-- provides a way to add RFC2822 messages to a git repository in a way
-  that is compatible with public-inbox
+- adds RFC2822 messages to git repositories compatible with public-inbox
+- supports public-inbox v2 format with automatic epoch management
 
 What it doesn't do:
 
 - anything else
-
-What it also does:
-
-- supports public-inbox v2 format with automatic epoch management
 
 For the public-inbox v2 format, see:
 
@@ -44,7 +40,7 @@ This is the simplest usage example:
 .. code-block:: python
 
   from email.message import EmailMessage
-  from ezpi import add_rfc822
+  from ezpi import add_rfc822_v2
 
   msg = EmailMessage()
   msg.set_content('Hello world!')
@@ -52,38 +48,19 @@ This is the simplest usage example:
   # to make a useful git commit with that data
   msg['Subject'] = 'My excellent subject'
   msg['From'] = 'E.X. Ample <example@example.com'>
-  # We won't create the repo for you, so run "git init --bare" first
-  add_rfc822('example.git', msg)
+  # The v2 inbox will be created automatically if it doesn't exist
+  add_rfc822_v2('/path/to/inbox', msg)
 
 You can also pass bytes instead of an EmailMessage object, but we must
 be able to run message_from_bytes() on it.
 
 ezpi command
 ------------
-We also provide an ezpi command::
+We also provide an ezpi command. Example::
 
-    usage: main.py [-h] [-r REPO] [-d] [-q] [-v] [--rfc822] [-f HDR_FROM] [-s HDR_SUBJ] [-p]
-                   [--domain DOMAIN]
+  ezpi --v2-path /path/to/inbox --rfc822 < valid.eml
 
-    optional arguments:
-      -h, --help            show this help message and exit
-      -r REPO, --repo REPO  Bare git repository where to write the commit (must exist) (default: None)
-      -d, --dry-run         Do not write the commit, just show the commit that would be written. (default:
-                            False)
-      -q, --quiet           Only output errors to the stdout (default: False)
-      -v, --verbose         Show debugging output (default: False)
-      --rfc822              Treat stdin as an rfc822 message (default: False)
-      -f HDR_FROM, --from HDR_FROM
-                            From header for the message, if not using --rfc822 (default: None)
-      -s HDR_SUBJ, --subject HDR_SUBJ
-                            Subject header for the message, if not using --rfc822 (default: None)
-      -p, --run-post-commit-hook
-                            Run hooks/post-commit after a successful commit (if present) (default: False)
-      --domain DOMAIN       Domain to use when creating message-ids (default: None)
-
-Example::
-
-  ezpi -r path/to/example/git/0.git --rfc822 < valid.eml
+Run ``ezpi --help`` for full usage information.
 
 How to delete messages?
 -----------------------
