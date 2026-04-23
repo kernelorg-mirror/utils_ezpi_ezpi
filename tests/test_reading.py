@@ -5,12 +5,44 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from email.utils import formatdate
 from pathlib import Path
 
 import pytest
 
 import ezpi
+
+
+def _count_git_children() -> int:
+    """Count `git cat-file --batch` child processes of this test process.
+
+    Used to detect subprocess leaks from the batch pipe. Walks /proc/*/stat
+    because psutil is not in the dev dependency set.
+    """
+    my_pid = os.getpid()
+    count = 0
+    for entry in os.listdir('/proc'):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f'/proc/{entry}/stat', 'rb') as f:
+                stat = f.read()
+            # /proc/N/stat: "pid (comm) state ppid ..."
+            # The command name can contain spaces, so slice after the trailing ')'.
+            end = stat.rindex(b')')
+            fields = stat[end + 2 :].split(b' ')
+            ppid = int(fields[1])
+            if ppid == my_pid:
+                # Re-read the comm (field 2) safely.
+                comm_start = stat.index(b'(')
+                comm = stat[comm_start + 1 : end]
+                if comm == b'git':
+                    count += 1
+        except (FileNotFoundError, ProcessLookupError, ValueError):
+            continue
+    return count
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -514,3 +546,140 @@ class TestCursorFileShape:
         assert data['cursor'] == 'myapp'
         assert set(data.keys()) == {'cursor', 'updated', 'epochs'}
         assert set(data['epochs']['0'].keys()) == {'commit', 'msgid', 'subject', 'commit_date'}
+
+
+# ---------------------------------------------------------------------------
+# _BatchCatFile helper
+# ---------------------------------------------------------------------------
+
+
+class TestBatchCatFile:
+    """Tests for the ``git cat-file --batch`` wrapper."""
+
+    def test_read_blob(self, tmp_path: Path) -> None:
+        v2path = tmp_path / 'inbox'
+        ezpi.add_rfc822_v2(str(v2path), _make_msg(0))
+        _ep, commit, _body = next(iter(ezpi.iter_messages(str(v2path))))
+        gitdir = str(v2path / 'git' / '0.git')
+        with ezpi._BatchCatFile(gitdir) as cf:
+            m_bytes = cf.read(f'{commit}:m')
+        assert m_bytes is not None
+        assert b'msg-0@example.com' in m_bytes
+
+    def test_missing_object_returns_none(self, tmp_path: Path) -> None:
+        v2path = tmp_path / 'inbox'
+        ezpi.init_v2_inbox(str(v2path))
+        ezpi.add_rfc822(str(v2path / 'git' / '0.git'), _make_msg(0))
+        gitdir = str(v2path / 'git' / '0.git')
+        with ezpi._BatchCatFile(gitdir) as cf:
+            assert cf.read('0' * 40 + ':m') is None
+            assert cf.read('deadbeef' * 5) is None
+
+    def test_multiple_sequential_reads_stay_aligned(self, tmp_path: Path) -> None:
+        """Reading several objects back-to-back must not desync the framing."""
+        v2path = tmp_path / 'inbox'
+        for i in range(5):
+            ezpi.add_rfc822_v2(str(v2path), _make_msg(i))
+        commits = [c for _, c, _ in ezpi.iter_messages(str(v2path))]
+        gitdir = str(v2path / 'git' / '0.git')
+        with ezpi._BatchCatFile(gitdir) as cf:
+            bodies = [cf.read(f'{c}:m') for c in commits]
+        for i, body in enumerate(bodies):
+            assert body is not None
+            assert f'msg-{i}@example.com'.encode() in body
+
+    def test_read_commit_object(self, tmp_path: Path) -> None:
+        """Batch also handles commit objects (used for committer-date lookup)."""
+        v2path = tmp_path / 'inbox'
+        ezpi.add_rfc822_v2(str(v2path), _make_msg(0))
+        _ep, commit, _body = next(iter(ezpi.iter_messages(str(v2path))))
+        gitdir = str(v2path / 'git' / '0.git')
+        with ezpi._BatchCatFile(gitdir) as cf:
+            obj = cf.read(f'{commit}^{{commit}}')
+        assert obj is not None
+        assert obj.startswith(b'tree ')
+        assert b'\ncommitter ' in obj
+
+    def test_context_manager_cleanup_on_exception(self, tmp_path: Path) -> None:
+        """__exit__ must close the subprocess even when the body raises."""
+        v2path = tmp_path / 'inbox'
+        ezpi.add_rfc822_v2(str(v2path), _make_msg(0))
+        gitdir = str(v2path / 'git' / '0.git')
+        cf = ezpi._BatchCatFile(gitdir)
+        with pytest.raises(RuntimeError), cf:
+            raise RuntimeError('boom')
+        # Access the private handle to confirm the child exited.
+        assert cf._proc.poll() is not None
+
+    def test_close_is_idempotent(self, tmp_path: Path) -> None:
+        v2path = tmp_path / 'inbox'
+        ezpi.add_rfc822_v2(str(v2path), _make_msg(0))
+        gitdir = str(v2path / 'git' / '0.git')
+        cf = ezpi._BatchCatFile(gitdir)
+        cf.close()
+        cf.close()  # should not raise
+        assert cf._proc.poll() is not None
+
+    def test_generator_break_closes_batch(self, tmp_path: Path) -> None:
+        """Abandoning iter_messages mid-stream must tear down the batch pipe
+        via generator close() (triggered by the for-loop break)."""
+        v2path = tmp_path / 'inbox'
+        for i in range(5):
+            ezpi.add_rfc822_v2(str(v2path), _make_msg(i))
+        before = _count_git_children()
+        # for + break is the canonical generator-abandonment path: CPython's
+        # refcounting runs the generator's close() as soon as the iterator
+        # reference drops, which runs __exit__ on the open `with` block.
+        for _ in ezpi.iter_messages(str(v2path)):
+            break
+        # Give the OS a brief moment to reap the exited child.
+        for _ in range(20):
+            if _count_git_children() <= before:
+                break
+            time.sleep(0.05)
+        assert _count_git_children() <= before, 'cat-file --batch subprocess leaked'
+
+
+# ---------------------------------------------------------------------------
+# _committer_date_from_commit_object
+# ---------------------------------------------------------------------------
+
+
+class TestCommitterDateFromCommitObject:
+    def _build_commit_object(self, unix_ts: int, tz: str) -> bytes:
+        # A minimal but valid commit object body. Trees/parents are not parsed
+        # by _committer_date_from_commit_object so we can use placeholders.
+        tree = '0' * 40
+        return (f'tree {tree}\nauthor Name <n@e> {unix_ts} {tz}\ncommitter Name <n@e> {unix_ts} {tz}\n\nmsg\n').encode()
+
+    def test_utc(self) -> None:
+        obj = self._build_commit_object(1_700_000_000, '+0000')
+        # 1700000000 = 2023-11-14 22:13:20 UTC
+        assert ezpi._committer_date_from_commit_object(obj) == '2023-11-14 22:13:20 +0000'
+
+    def test_positive_offset(self) -> None:
+        obj = self._build_commit_object(1_700_000_000, '+0530')
+        # Same instant, rendered in +0530 = 2023-11-15 03:43:20
+        assert ezpi._committer_date_from_commit_object(obj) == '2023-11-15 03:43:20 +0530'
+
+    def test_negative_offset(self) -> None:
+        obj = self._build_commit_object(1_700_000_000, '-0500')
+        # Same instant, rendered in -0500 = 2023-11-14 17:13:20
+        assert ezpi._committer_date_from_commit_object(obj) == '2023-11-14 17:13:20 -0500'
+
+    def test_matches_git_cli_output(self, tmp_path: Path) -> None:
+        """Output must be a drop-in for ``git log -1 --format=%ci``."""
+        v2path = tmp_path / 'inbox'
+        ezpi.add_rfc822_v2(str(v2path), _make_msg(0))
+        _ep, commit, _body = next(iter(ezpi.iter_messages(str(v2path))))
+        gitdir = str(v2path / 'git' / '0.git')
+        cli_date = ezpi._commit_date(gitdir, commit)
+        with ezpi._BatchCatFile(gitdir) as cf:
+            obj = cf.read(f'{commit}^{{commit}}')
+        assert obj is not None
+        parsed = ezpi._committer_date_from_commit_object(obj)
+        assert parsed == cli_date
+
+    def test_no_committer_line_raises(self) -> None:
+        with pytest.raises(ezpi.CursorError):
+            ezpi._committer_date_from_commit_object(b'tree 00\n\nno committer here\n')

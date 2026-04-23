@@ -867,12 +867,6 @@ def _commit_date(gitdir: str, commit: str) -> str:
     return out.decode().strip()
 
 
-def _commit_exists(gitdir: str, commit: str) -> bool:
-    """Return True if ``commit`` is present in the repo object graph."""
-    retcode, _out, _err = git_run_command(gitdir, ['cat-file', '-e', f'{commit}^{{commit}}'])
-    return retcode == 0
-
-
 def _is_on_current_history(gitdir: str, commit: str) -> bool:
     """Return True if ``commit`` is reachable from :data:`PI_HEAD`.
 
@@ -886,30 +880,205 @@ def _is_on_current_history(gitdir: str, commit: str) -> bool:
     return retcode == 0
 
 
-def _has_m_blob(gitdir: str, commit: str) -> bool:
-    """Return True if ``commit`` contains an ``m`` blob in its tree.
-
-    Public-inbox v2 writes messages as the ``m`` file and uses commits
-    without ``m`` (or with a ``d`` file instead) for deletion/purge markers.
-    """
-    retcode, _out, _err = git_run_command(gitdir, ['cat-file', '-e', f'{commit}:m'])
-    return retcode == 0
-
-
-def _read_m_blob(gitdir: str, commit: str) -> bytes:
-    """Return the raw bytes of the ``m`` blob for ``commit``."""
-    retcode, out, err = git_run_command(gitdir, ['cat-file', 'blob', f'{commit}:m'])
-    if retcode != 0:
-        raise CursorError(f'Could not read m blob for {commit}: {err.decode(errors="replace")}')
-    return out
-
-
 def _top_commit(gitdir: str) -> str | None:
     """Return the current HEAD commit hash, or None if the repo has no commits."""
     retcode, out, _err = git_run_command(gitdir, ['rev-parse', PI_HEAD])
     if retcode != 0:
         return None
     return out.decode().strip() or None
+
+
+class _BatchCatFile:
+    """Persistent ``git cat-file --batch`` pipe for bulk object reads.
+
+    Walking a public-inbox epoch used to fork three short-lived ``git``
+    processes per yielded message (existence check + m-blob check + blob
+    read). Over a real inbox that cost dominates wall time. Keeping a single
+    ``cat-file --batch`` pipe open for the duration of the walk collapses
+    every per-message check into one or two line-based I/O round trips.
+
+    Always use as a context manager. When wrapped in a generator, the pipe
+    is torn down deterministically on generator close -- including the
+    implicit close that runs when the caller ``break``\\ s out of iteration
+    or abandons the generator to garbage collection.
+    """
+
+    def __init__(self, gitdir: str) -> None:
+        # --buffer is deliberately NOT passed so each line written to stdin
+        # triggers an immediate response; see git-cat-file(1) BATCH OUTPUT.
+        self._proc = subprocess.Popen(
+            ['git', '--git-dir', gitdir, '--no-pager', 'cat-file', '--batch'],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def read(self, spec: str) -> bytes | None:
+        """Fetch the object referenced by ``spec`` (e.g. ``<commit>:m``).
+
+        Returns the raw object bytes, or ``None`` if git reports the spec as
+        missing. Raises :class:`CursorError` if the pipe is closed or the
+        framing is corrupt.
+        """
+        stdin = self._proc.stdin
+        stdout = self._proc.stdout
+        assert stdin is not None and stdout is not None
+        stdin.write(spec.encode() + b'\n')
+        stdin.flush()
+        header = stdout.readline()
+        if not header:
+            raise CursorError('git cat-file --batch pipe closed unexpectedly')
+        if header.endswith(b' missing\n'):
+            return None
+        # Header is "<oid> <type> <size>\n".
+        try:
+            size = int(header.rstrip(b'\n').rsplit(b' ', 1)[-1])
+        except (ValueError, IndexError) as exc:
+            raise CursorError(f'Unparseable cat-file batch header: {header!r}') from exc
+        # Pipes are free to short-read; loop until we have the full payload.
+        chunks: list[bytes] = []
+        remaining = size
+        while remaining > 0:
+            chunk = stdout.read(remaining)
+            if not chunk:
+                raise CursorError('git cat-file --batch short read')
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        # Each object is followed by a single LF in the batch stream.
+        trailer = stdout.read(1)
+        if trailer != b'\n':
+            raise CursorError(f'Missing object trailer in cat-file batch stream: {trailer!r}')
+        return b''.join(chunks)
+
+    def close(self) -> None:
+        """Terminate the underlying git process. Idempotent and safe."""
+        if self._proc.poll() is not None:
+            return
+        if self._proc.stdin is not None:
+            with contextlib.suppress(OSError, ValueError):
+                self._proc.stdin.close()
+        try:
+            self._proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+            self._proc.wait()
+
+    def __enter__(self) -> _BatchCatFile:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+
+def _committer_date_from_commit_object(commit_bytes: bytes) -> str:
+    """Extract the committer date from a raw git commit object.
+
+    Formats the result as git's ``%ci`` style (``YYYY-MM-DD HH:MM:SS +ZZZZ``)
+    so it is a drop-in substitute for :func:`_commit_date`. This lets callers
+    compute the committer date from a commit object they already hold in
+    memory (typically from a :class:`_BatchCatFile` read) instead of spawning
+    a separate ``git log -1`` subprocess.
+    """
+    for line in commit_bytes.split(b'\n'):
+        if not line.startswith(b'committer '):
+            continue
+        # "committer <name> <<email>> <unix-ts> <+HHMM>"
+        parts = line.rsplit(b' ', 2)
+        if len(parts) != 3:
+            break
+        try:
+            unix_ts = int(parts[1])
+            tz_str = parts[2].decode()
+            sign = 1 if tz_str[0] == '+' else -1
+            hours = int(tz_str[1:3])
+            minutes = int(tz_str[3:5])
+        except (ValueError, IndexError) as exc:
+            raise CursorError(f'Unparseable committer line: {line!r}') from exc
+        offset = datetime.timedelta(hours=sign * hours, minutes=sign * minutes)
+        dt = datetime.datetime.fromtimestamp(unix_ts, tz=datetime.timezone(offset))
+        return dt.strftime('%Y-%m-%d %H:%M:%S %z')
+    raise CursorError('No committer line found in commit object')
+
+
+def _cursor_entry_from_batch(cf: _BatchCatFile, commit: str) -> dict[str, str]:
+    """Build a cursor-state epoch entry for ``commit`` using an open batch.
+
+    Fetches both the ``m`` blob (for msgid/subject) and the commit object
+    (for committer date) via ``cf``. If the commit has no ``m`` blob (a
+    noop/purge commit that happens to be the current HEAD of an epoch),
+    msgid and subject fall back to the shared sentinels.
+    """
+    m_bytes = cf.read(f'{commit}:m')
+    if m_bytes is not None:
+        headers = _peek_cursor_headers(m_bytes)
+    else:
+        headers = {'subject': _NO_SUBJECT, 'msgid': _NO_MSGID}
+    commit_obj = cf.read(f'{commit}^{{commit}}')
+    if commit_obj is None:
+        raise CursorError(f'Commit {commit} is not present in the repository')
+    return {
+        'commit': commit,
+        'msgid': headers['msgid'],
+        'subject': headers['subject'],
+        'commit_date': _committer_date_from_commit_object(commit_obj),
+    }
+
+
+def _iter_messages_internal(
+    v2path: str,
+    since: dict[int, str],
+    include_commit_date: bool,
+) -> Iterator[tuple[int, str, bytes, str | None]]:
+    """Shared iteration core for :func:`iter_messages` and :func:`iter_new_messages`.
+
+    Opens one long-lived ``git cat-file --batch`` pipe per epoch. Yields a
+    4-tuple ``(epoch, commit, m_bytes, commit_date)`` where ``commit_date``
+    is the committer date in git's ``%ci`` format when
+    ``include_commit_date=True`` and ``None`` otherwise. When it is ``None``
+    we skip fetching the commit object entirely, saving one batch round trip
+    per message on the pure-iter path.
+    """
+    for epoch, gitdir in get_all_epochs(v2path):
+        if _top_commit(gitdir) is None:
+            # Empty epoch -- nothing to yield, and any stored cursor position
+            # for it is moot (the ref doesn't exist yet).
+            continue
+        since_commit = since.get(epoch)
+        if since_commit is not None:
+            if not _is_on_current_history(gitdir, since_commit):
+                raise StaleCommitError(epoch, since_commit)
+            revspec = f'{since_commit}..{PI_HEAD}'
+        else:
+            revspec = PI_HEAD
+
+        retcode, out, err = git_run_command(gitdir, ['rev-list', '--reverse', revspec])
+        if retcode != 0:
+            raise CursorError(f'git rev-list failed in epoch {epoch}: {err.decode(errors="replace")}')
+
+        commits = out.decode().splitlines()
+        if not commits:
+            continue
+        # The generator close() machinery will run this `with` block's
+        # __exit__ if the caller breaks out of iteration or abandons the
+        # generator -- so the batch subprocess is always torn down cleanly.
+        with _BatchCatFile(gitdir) as cf:
+            for commit in commits:
+                m_bytes = cf.read(f'{commit}:m')
+                if m_bytes is None:
+                    # Ambiguous: either a noop commit (no m blob in its tree)
+                    # or a corrupt/missing commit object. Distinguish via a
+                    # direct query, same bad-object detection korgalore
+                    # learned the hard way (see korgalore pi_feed.py:371).
+                    if cf.read(f'{commit}^{{commit}}') is None:
+                        raise CursorError(f'Commit {commit} in epoch {epoch} is not a valid object')
+                    continue
+                commit_date: str | None = None
+                if include_commit_date:
+                    commit_obj = cf.read(f'{commit}^{{commit}}')
+                    if commit_obj is None:
+                        raise CursorError(f'Commit {commit} in epoch {epoch} vanished mid-read')
+                    commit_date = _committer_date_from_commit_object(commit_obj)
+                yield epoch, commit, m_bytes, commit_date
 
 
 def iter_messages(
@@ -936,40 +1105,8 @@ def iter_messages(
             the epoch and hash so the cursor-aware layer can recover.
         CursorError: On unexpected git failures while reading blobs.
     """
-    if since is None:
-        since = {}
-
-    for epoch, gitdir in get_all_epochs(v2path):
-        if _top_commit(gitdir) is None:
-            # Empty epoch -- nothing to yield, and any stored cursor position
-            # for it is moot (the ref doesn't exist yet).
-            continue
-        since_commit = since.get(epoch)
-        if since_commit is not None:
-            if not _is_on_current_history(gitdir, since_commit):
-                raise StaleCommitError(epoch, since_commit)
-            revspec = f'{since_commit}..{PI_HEAD}'
-        else:
-            revspec = PI_HEAD
-
-        retcode, out, err = git_run_command(gitdir, ['rev-list', '--reverse', revspec])
-        if retcode != 0:
-            # An empty repo (no PI_HEAD yet) fails rev-parse inside rev-list;
-            # treat that as "no commits to yield" rather than an error.
-            if not _top_commit(gitdir):
-                continue
-            raise CursorError(f'git rev-list failed in epoch {epoch}: {err.decode(errors="replace")}')
-
-        commits = out.decode().splitlines()
-        for commit in commits:
-            # Must verify the commit object exists before asking about its
-            # tree -- a bad/missing object would otherwise look like a noop.
-            # (mirrors korgalore pi_feed.py:371)
-            if not _commit_exists(gitdir, commit):
-                raise CursorError(f'Commit {commit} in epoch {epoch} is not a valid object')
-            if not _has_m_blob(gitdir, commit):
-                continue
-            yield epoch, commit, _read_m_blob(gitdir, commit)
+    for epoch, commit, m_bytes, _ in _iter_messages_internal(v2path, since or {}, include_commit_date=False):
+        yield epoch, commit, m_bytes
 
 
 def _cursor_path(v2path: str, cursor_name: str) -> str:
@@ -1032,6 +1169,7 @@ def save_cursor(
     epoch: int,
     commit: str,
     msg_bytes: bytes,
+    commit_date: str | None = None,
 ) -> None:
     """Persist a cursor position after processing a message.
 
@@ -1044,10 +1182,17 @@ def save_cursor(
         epoch: The epoch containing ``commit``.
         commit: The commit hash just processed.
         msg_bytes: The raw message bytes yielded for that commit.
+        commit_date: Optional pre-computed committer date in git's ``%ci``
+            format (``YYYY-MM-DD HH:MM:SS +ZZZZ``). If omitted, a
+            ``git log -1 --format=%ci`` subprocess is spawned. Callers
+            iterating with :func:`iter_new_messages` and ``auto_advance``
+            receive this value for free and pass it through to avoid the
+            extra fork.
     """
     gitdir = os.path.join(v2path, 'git', f'{epoch}.git')
     headers = _peek_cursor_headers(msg_bytes)
-    commit_date = _commit_date(gitdir, commit)
+    if commit_date is None:
+        commit_date = _commit_date(gitdir, commit)
 
     existing = load_cursor(v2path, cursor_name) or {}
     raw_epochs = existing.get('epochs', {})
@@ -1131,75 +1276,63 @@ def recover_cursor(v2path: str, cursor_name: str, epoch: int) -> str:
 
     gitdir = os.path.join(v2path, 'git', f'{epoch}.git')
 
-    def _fast_forward(reason: str) -> str:
-        top = _top_commit(gitdir)
-        if top is None:
-            # Epoch is empty -- drop any stale state we had for it.
-            fresh = {int(k): v for k, v in epochs_state.items() if k != str(epoch)}
-            _save_cursor_raw(v2path, cursor_name, fresh)
-            raise CursorStateError(
-                f'Cannot recover cursor {cursor_name} for epoch {epoch}: {reason} and epoch is empty'
-            )
-        logger.warning('Cursor %s epoch %d: %s, fast-forwarding to %s', cursor_name, epoch, reason, top)
-        new_epochs = {int(k): dict(v) for k, v in epochs_state.items()}
-        new_epochs[epoch] = {
-            'commit': top,
-            'msgid': _peek_cursor_headers(_read_m_blob(gitdir, top))['msgid']
-            if _has_m_blob(gitdir, top)
-            else _NO_MSGID,
-            'subject': _peek_cursor_headers(_read_m_blob(gitdir, top))['subject']
-            if _has_m_blob(gitdir, top)
-            else _NO_SUBJECT,
-            'commit_date': _commit_date(gitdir, top),
-        }
-        _save_cursor_raw(v2path, cursor_name, new_epochs)
-        return top
+    # One batch pipe for the whole recovery: candidate-walk reads, the
+    # fast-forward fallback read, and the final chosen-commit read all go
+    # through a single persistent git process.
+    with _BatchCatFile(gitdir) as cf:
 
-    retcode, out, _err = git_run_command(gitdir, ['rev-list', '--reverse', '--since-as-filter', commit_date, PI_HEAD])
-    if retcode != 0:
-        return _fast_forward('rev-list failed during recovery')
+        def _fast_forward(reason: str) -> str:
+            top = _top_commit(gitdir)
+            if top is None:
+                # Epoch is empty -- drop any stale state we had for it.
+                fresh = {int(k): v for k, v in epochs_state.items() if k != str(epoch)}
+                _save_cursor_raw(v2path, cursor_name, fresh)
+                raise CursorStateError(
+                    f'Cannot recover cursor {cursor_name} for epoch {epoch}: {reason} and epoch is empty'
+                )
+            logger.warning('Cursor %s epoch %d: %s, fast-forwarding to %s', cursor_name, epoch, reason, top)
+            new_epochs_ff = {int(k): dict(v) for k, v in epochs_state.items()}
+            new_epochs_ff[epoch] = _cursor_entry_from_batch(cf, top)
+            _save_cursor_raw(v2path, cursor_name, new_epochs_ff)
+            return top
 
-    candidates = out.decode().splitlines()
-    if not candidates:
-        return _fast_forward('no commits at or after stored commit_date')
-
-    matched: str | None = None
-    for candidate in candidates:
-        if not _has_m_blob(gitdir, candidate):
-            continue
-        headers = _peek_cursor_headers(_read_m_blob(gitdir, candidate))
-        if headers['subject'] == stored_subject and headers['msgid'] == stored_msgid:
-            matched = candidate
-            break
-
-    chosen: str
-    chosen_headers: dict[str, str]
-    if matched is not None:
-        chosen = matched
-        chosen_headers = _peek_cursor_headers(_read_m_blob(gitdir, chosen))
-        logger.debug('Cursor %s epoch %d: recovered exact match at %s', cursor_name, epoch, chosen)
-    else:
-        chosen = candidates[0]
-        if _has_m_blob(gitdir, chosen):
-            chosen_headers = _peek_cursor_headers(_read_m_blob(gitdir, chosen))
-        else:
-            chosen_headers = {'subject': _NO_SUBJECT, 'msgid': _NO_MSGID}
-        logger.warning(
-            'Cursor %s epoch %d: no exact match after rebase, resuming at first candidate %s (may skip or re-deliver)',
-            cursor_name,
-            epoch,
-            chosen,
+        retcode, out, _err = git_run_command(
+            gitdir, ['rev-list', '--reverse', '--since-as-filter', commit_date, PI_HEAD]
         )
+        if retcode != 0:
+            return _fast_forward('rev-list failed during recovery')
 
-    new_epochs = {int(k): dict(v) for k, v in epochs_state.items()}
-    new_epochs[epoch] = {
-        'commit': chosen,
-        'msgid': chosen_headers['msgid'],
-        'subject': chosen_headers['subject'],
-        'commit_date': _commit_date(gitdir, chosen),
-    }
-    _save_cursor_raw(v2path, cursor_name, new_epochs)
-    return chosen
+        candidates = out.decode().splitlines()
+        if not candidates:
+            return _fast_forward('no commits at or after stored commit_date')
+
+        matched: str | None = None
+        for candidate in candidates:
+            m_bytes = cf.read(f'{candidate}:m')
+            if m_bytes is None:
+                continue  # noop commit in the candidate range
+            headers = _peek_cursor_headers(m_bytes)
+            if headers['subject'] == stored_subject and headers['msgid'] == stored_msgid:
+                matched = candidate
+                break
+
+        if matched is not None:
+            chosen = matched
+            logger.debug('Cursor %s epoch %d: recovered exact match at %s', cursor_name, epoch, chosen)
+        else:
+            chosen = candidates[0]
+            logger.warning(
+                'Cursor %s epoch %d: no exact match after rebase, resuming at first candidate %s '
+                '(may skip or re-deliver)',
+                cursor_name,
+                epoch,
+                chosen,
+            )
+
+        new_epochs = {int(k): dict(v) for k, v in epochs_state.items()}
+        new_epochs[epoch] = _cursor_entry_from_batch(cf, chosen)
+        _save_cursor_raw(v2path, cursor_name, new_epochs)
+        return chosen
 
 
 def iter_new_messages(
@@ -1260,10 +1393,15 @@ def iter_new_messages(
 
     while True:
         try:
-            for epoch, commit, msg_bytes in iter_messages(v2path, since=since):
+            for epoch, commit, msg_bytes, commit_date in _iter_messages_internal(
+                v2path, since, include_commit_date=auto_advance
+            ):
                 yield epoch, commit, msg_bytes
                 if auto_advance:
-                    save_cursor(v2path, cursor_name, epoch, commit, msg_bytes)
+                    # commit_date came from the per-epoch batch pipe, so this
+                    # save_cursor call does not need to spawn its own git
+                    # subprocess.
+                    save_cursor(v2path, cursor_name, epoch, commit, msg_bytes, commit_date=commit_date)
                     since[epoch] = commit
             return
         except StaleCommitError as exc:
@@ -1282,16 +1420,8 @@ def _initialize_cursor_at_head(v2path: str, cursor_name: str) -> None:
         top = _top_commit(gitdir)
         if top is None:
             continue
-        if _has_m_blob(gitdir, top):
-            headers = _peek_cursor_headers(_read_m_blob(gitdir, top))
-        else:
-            headers = {'subject': _NO_SUBJECT, 'msgid': _NO_MSGID}
-        per_epoch[epoch] = {
-            'commit': top,
-            'msgid': headers['msgid'],
-            'subject': headers['subject'],
-            'commit_date': _commit_date(gitdir, top),
-        }
+        with _BatchCatFile(gitdir) as cf:
+            per_epoch[epoch] = _cursor_entry_from_batch(cf, top)
     _save_cursor_raw(v2path, cursor_name, per_epoch)
 
 

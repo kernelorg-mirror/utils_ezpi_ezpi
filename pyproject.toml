@@ -94,7 +94,9 @@ exclude = ["^setup\\.py$"]
 # pyright automatically ignores virtual environments and other directories, but
 # once we specify `exclude`, we're on our own. See
 # https://github.com/microsoft/pyright/issues/9057#issuecomment-2366938099.
-exclude = [".venv", "setup.py"]
+# ".venv-*" catches the per-interpreter venvs that ci-matrix.sh leaves behind
+# (without them, pyright tries to type-check ~40 packages in each one).
+exclude = [".venv", ".venv-*", "setup.py"]
 typeCheckingMode = "strict"
 
 # Overly strict rules.
