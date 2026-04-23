@@ -29,6 +29,7 @@ Example usage::
     # Use annual epoch rotation (new epoch each January)
     ezpi.add_rfc822_v2('/path/to/inbox', msg, auto_epoch='annual')
 """
+
 from __future__ import annotations
 
 __author__ = 'Konstantin Ryabitsev <konstantin@linuxfoundation.org>'
@@ -53,9 +54,10 @@ from typing import IO, Any
 # Optional pygit2 support
 try:
     import pygit2
+
     HAS_PYGIT2 = True
 except ImportError:
-    pygit2 = None  # type: ignore[assignment]
+    pygit2 = None  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
     HAS_PYGIT2 = False
 
 charset.add_charset('utf-8', charset.SHORTEST)
@@ -164,7 +166,7 @@ def _parse_git_env_date(date_str: str | None) -> tuple[int, int] | None:
             pass
     for fmt in ('%Y-%m-%d %H:%M:%S %z', '%Y-%m-%dT%H:%M:%S%z'):
         try:
-            dt = datetime.datetime.strptime(date_str, fmt)
+            dt = datetime.datetime.strptime(date_str, fmt)  # noqa: DTZ007  (both formats include %z)
         except ValueError:
             continue
         offset = dt.utcoffset()
@@ -217,7 +219,7 @@ def _pygit2_write_commit(repo: str, env: dict[str, str], c_msg: str, body: bytes
     # Get parent commit if exists
     parents: Sequence[str] = []
     try:
-        ref = repository.references.get(PI_HEAD)  # type: ignore[attr-defined]
+        ref = repository.references.get(PI_HEAD)
         if ref is not None:
             parents = [str(ref.target)]
     except KeyError:
@@ -230,7 +232,7 @@ def _pygit2_write_commit(repo: str, env: dict[str, str], c_msg: str, body: bytes
         committer,
         c_msg,
         tree_id,
-        parents,  # type: ignore[arg-type]
+        parents,
     )
     logger.debug('Created commit %s (pygit2)', commit_id)
 
@@ -246,13 +248,13 @@ def _pygit2_get_latest_commit_time(repo_path: str) -> int | None:
     """
     try:
         repository = pygit2.Repository(repo_path)
-        ref = repository.references.get(PI_HEAD)  # type: ignore[attr-defined]
+        ref = repository.references.get(PI_HEAD)
         if ref is None:
             return None
-        commit = repository.get(ref.target)  # type: ignore[attr-defined]
+        commit = repository.get(ref.target)
         if commit is None:
             return None
-        return int(commit.commit_time)
+        return int(commit.commit_time)  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
     except (KeyError, pygit2.GitError):
         return None
 
@@ -520,7 +522,7 @@ def run_hook(repo: str) -> None:
         curdir = os.getcwd()
         os.chdir(repo)
         pp = subprocess.Popen(['hooks/post-commit'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        (output, error) = pp.communicate()
+        (_output, error) = pp.communicate()
         if pp.returncode > 0:
             logger.critical('Running post-commit hook failed')
             logger.critical('STDERR follows')
@@ -552,7 +554,7 @@ def init_epoch(v2path: str, epoch: int) -> str:
     if _use_pygit2():
         _pygit2_init_repo(epoch_path)
     else:
-        ee, out, err = git_run_command('', ['init', '--bare', epoch_path])
+        ee, _out, err = git_run_command('', ['init', '--bare', epoch_path])
         if ee > 0:
             raise RuntimeError(f'Could not init epoch {epoch}: {err.decode()}')
 
@@ -613,7 +615,7 @@ def init_v2_inbox(v2path: str) -> str:
     if _use_pygit2():
         _pygit2_init_repo(all_git)
     else:
-        ee, out, err = git_run_command('', ['init', '--bare', all_git])
+        ee, _out, err = git_run_command('', ['init', '--bare', all_git])
         if ee > 0:
             raise RuntimeError(f'Could not init all.git: {err.decode()}')
 
@@ -738,12 +740,13 @@ def should_rotate_epoch(epoch_path: str, mode: str) -> bool:
     if mode == 'annual':
         # Check if latest commit is from a previous year
         import datetime
+
         if _use_pygit2():
             timestamp = _pygit2_get_latest_commit_time(epoch_path)
             if timestamp is None:
                 return False
         else:
-            ee, out, err = git_run_command(epoch_path, ['log', '-1', '--format=%ct', PI_HEAD])
+            ee, out, _err = git_run_command(epoch_path, ['log', '-1', '--format=%ct', PI_HEAD])
             if ee > 0:
                 # No commits yet, no rotation needed
                 return False
@@ -752,8 +755,9 @@ def should_rotate_epoch(epoch_path: str, mode: str) -> bool:
             except (ValueError, OSError):
                 return False
         try:
-            commit_year = datetime.datetime.fromtimestamp(timestamp).year
-            current_year = datetime.datetime.now().year
+            tz = datetime.timezone.utc
+            commit_year = datetime.datetime.fromtimestamp(timestamp, tz=tz).year
+            current_year = datetime.datetime.now(tz=tz).year
             return commit_year < current_year
         except (ValueError, OSError):
             return False
@@ -878,9 +882,7 @@ def _is_on_current_history(gitdir: str, commit: str) -> bool:
     ``merge-base --is-ancestor`` asks the right question -- "is this hash
     on the current history?" -- regardless of object-store state.
     """
-    retcode, _out, _err = git_run_command(
-        gitdir, ['merge-base', '--is-ancestor', commit, PI_HEAD]
-    )
+    retcode, _out, _err = git_run_command(gitdir, ['merge-base', '--is-ancestor', commit, PI_HEAD])
     return retcode == 0
 
 
@@ -1143,17 +1145,17 @@ def recover_cursor(v2path: str, cursor_name: str, epoch: int) -> str:
         new_epochs[epoch] = {
             'commit': top,
             'msgid': _peek_cursor_headers(_read_m_blob(gitdir, top))['msgid']
-            if _has_m_blob(gitdir, top) else _NO_MSGID,
+            if _has_m_blob(gitdir, top)
+            else _NO_MSGID,
             'subject': _peek_cursor_headers(_read_m_blob(gitdir, top))['subject']
-            if _has_m_blob(gitdir, top) else _NO_SUBJECT,
+            if _has_m_blob(gitdir, top)
+            else _NO_SUBJECT,
             'commit_date': _commit_date(gitdir, top),
         }
         _save_cursor_raw(v2path, cursor_name, new_epochs)
         return top
 
-    retcode, out, _err = git_run_command(
-        gitdir, ['rev-list', '--reverse', '--since-as-filter', commit_date, PI_HEAD]
-    )
+    retcode, out, _err = git_run_command(gitdir, ['rev-list', '--reverse', '--since-as-filter', commit_date, PI_HEAD])
     if retcode != 0:
         return _fast_forward('rev-list failed during recovery')
 
@@ -1183,9 +1185,10 @@ def recover_cursor(v2path: str, cursor_name: str, epoch: int) -> str:
         else:
             chosen_headers = {'subject': _NO_SUBJECT, 'msgid': _NO_MSGID}
         logger.warning(
-            'Cursor %s epoch %d: no exact match after rebase, resuming at first '
-            'candidate %s (may skip or re-deliver)',
-            cursor_name, epoch, chosen,
+            'Cursor %s epoch %d: no exact match after rebase, resuming at first candidate %s (may skip or re-deliver)',
+            cursor_name,
+            epoch,
+            chosen,
         )
 
     new_epochs = {int(k): dict(v) for k, v in epochs_state.items()}
@@ -1314,32 +1317,46 @@ def command() -> None:
     """
     import argparse
     import sys
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
+
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     repo_group = parser.add_mutually_exclusive_group(required=True)
-    repo_group.add_argument('-r', '--repo', default=None,
-                            help='Bare git repository where to write the commit (must exist)')
-    repo_group.add_argument('--v2-path', dest='v2path', default=None,
-                            help='Path to public-inbox v2 format inbox')
-    parser.add_argument('--auto-epoch', dest='auto_epoch', choices=['size', 'annual'], default=None,
-                        help='Epoch rotation mode for v2 format: size (1GB, default) or annual (Jan 1)')
-    parser.add_argument('-d', '--dry-run', dest='dryrun', action='store_true', default=False,
-                        help='Do not write the commit, just show the commit that would be written.')
-    parser.add_argument('-q', '--quiet', action='store_true', default=False,
-                        help='Only output errors to the stdout')
-    parser.add_argument('-v', '--verbose', action='store_true', default=False,
-                        help='Show debugging output')
-    parser.add_argument('--rfc822', action='store_true', default=False,
-                        help='Treat stdin as an rfc822 message')
-    parser.add_argument('-f', '--from', dest='hdr_from', default=None,
-                        help='From header for the message, if not using --rfc822')
-    parser.add_argument('-s', '--subject', dest='hdr_subj', default=None,
-                        help='Subject header for the message, if not using --rfc822')
-    parser.add_argument('-p', '--run-post-commit-hook', action='store_true', dest='runhook', default=False,
-                        help='Run hooks/post-commit after a successful commit (if present)')
-    parser.add_argument('--domain', default=None,
-                        help='Domain to use when creating message-ids')
+    repo_group.add_argument(
+        '-r', '--repo', default=None, help='Bare git repository where to write the commit (must exist)'
+    )
+    repo_group.add_argument('--v2-path', dest='v2path', default=None, help='Path to public-inbox v2 format inbox')
+    parser.add_argument(
+        '--auto-epoch',
+        dest='auto_epoch',
+        choices=['size', 'annual'],
+        default=None,
+        help='Epoch rotation mode for v2 format: size (1GB, default) or annual (Jan 1)',
+    )
+    parser.add_argument(
+        '-d',
+        '--dry-run',
+        dest='dryrun',
+        action='store_true',
+        default=False,
+        help='Do not write the commit, just show the commit that would be written.',
+    )
+    parser.add_argument('-q', '--quiet', action='store_true', default=False, help='Only output errors to the stdout')
+    parser.add_argument('-v', '--verbose', action='store_true', default=False, help='Show debugging output')
+    parser.add_argument('--rfc822', action='store_true', default=False, help='Treat stdin as an rfc822 message')
+    parser.add_argument(
+        '-f', '--from', dest='hdr_from', default=None, help='From header for the message, if not using --rfc822'
+    )
+    parser.add_argument(
+        '-s', '--subject', dest='hdr_subj', default=None, help='Subject header for the message, if not using --rfc822'
+    )
+    parser.add_argument(
+        '-p',
+        '--run-post-commit-hook',
+        action='store_true',
+        dest='runhook',
+        default=False,
+        help='Run hooks/post-commit after a successful commit (if present)',
+    )
+    parser.add_argument('--domain', default=None, help='Domain to use when creating message-ids')
 
     _args = parser.parse_args()
 
