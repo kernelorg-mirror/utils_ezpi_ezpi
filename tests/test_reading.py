@@ -103,6 +103,50 @@ def _commit_count(v2path: Path, epoch: int) -> int:
     return int(result.stdout.strip())
 
 
+def _append_noop_commit(epoch_path: str) -> str:
+    """Append a purge/rm style commit (empty tree, no ``m`` blob) to an epoch.
+
+    If the epoch already has commits the noop is parented on the current
+    HEAD; otherwise it becomes the root commit. Returns the new commit hash,
+    which is left pointed to by :data:`ezpi.PI_HEAD`.
+    """
+    rev = subprocess.run(
+        ['git', '--git-dir', epoch_path, 'rev-parse', ezpi.PI_HEAD],
+        capture_output=True,
+        text=True,
+    )
+    parent = rev.stdout.strip() if rev.returncode == 0 else None
+    empty_tree = subprocess.run(
+        ['git', '--git-dir', epoch_path, 'mktree'],
+        input='',
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    args = ['git', '--git-dir', epoch_path, 'commit-tree', '-m', 'purge']
+    if parent:
+        args.extend(['-p', parent])
+    args.append(empty_tree)
+    noop = subprocess.run(
+        args,
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            'GIT_AUTHOR_NAME': 'p',
+            'GIT_AUTHOR_EMAIL': 'p@e',
+            'GIT_COMMITTER_NAME': 'p',
+            'GIT_COMMITTER_EMAIL': 'p@e',
+        },
+    ).stdout.strip()
+    subprocess.run(
+        ['git', '--git-dir', epoch_path, 'update-ref', ezpi.PI_HEAD, noop],
+        check=True,
+    )
+    return noop
+
+
 # ---------------------------------------------------------------------------
 # get_all_epochs
 # ---------------------------------------------------------------------------
@@ -183,38 +227,8 @@ class TestIterMessages:
         v2path = tmp_path / 'inbox'
         for i in range(2):
             ezpi.add_rfc822_v2(str(v2path), _make_msg(i))
-        # Fabricate a noop commit: empty tree, parent = current HEAD
         epoch_path = str(v2path / 'git' / '0.git')
-        parent = subprocess.run(
-            ['git', '--git-dir', epoch_path, 'rev-parse', ezpi.PI_HEAD],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        empty_tree = subprocess.run(
-            ['git', '--git-dir', epoch_path, 'mktree'],
-            input='',
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        noop = subprocess.run(
-            ['git', '--git-dir', epoch_path, 'commit-tree', '-p', parent, '-m', 'purge', empty_tree],
-            check=True,
-            capture_output=True,
-            text=True,
-            env={
-                **os.environ,
-                'GIT_AUTHOR_NAME': 'p',
-                'GIT_AUTHOR_EMAIL': 'p@e',
-                'GIT_COMMITTER_NAME': 'p',
-                'GIT_COMMITTER_EMAIL': 'p@e',
-            },
-        ).stdout.strip()
-        subprocess.run(
-            ['git', '--git-dir', epoch_path, 'update-ref', ezpi.PI_HEAD, noop],
-            check=True,
-        )
+        _append_noop_commit(epoch_path)
         # Add another real message after the noop.
         ezpi.add_rfc822(epoch_path, _make_msg(2))
         msgs = list(ezpi.iter_messages(str(v2path)))
@@ -346,6 +360,22 @@ class TestIterNewMessagesFirstUse:
         with pytest.raises(ValueError):
             list(ezpi.iter_new_messages(str(v2path), 'foo', start='garbage'))
 
+    def test_first_use_head_with_noop_at_tip(self, tmp_path: Path) -> None:
+        """If the epoch's current HEAD is itself a noop (no ``m`` blob), the
+        first-use seed must succeed and record sentinel msgid/subject rather
+        than crashing."""
+        v2path = tmp_path / 'inbox'
+        ezpi.add_rfc822_v2(str(v2path), _make_msg(0))
+        epoch_path = str(v2path / 'git' / '0.git')
+        noop_hash = _append_noop_commit(epoch_path)
+        assert list(ezpi.iter_new_messages(str(v2path), 'foo')) == []
+        state = ezpi.load_cursor(str(v2path), 'foo')
+        assert state is not None
+        entry = state['epochs']['0']
+        assert entry['commit'] == noop_hash
+        assert entry['msgid'] == '(no message-id)'
+        assert entry['subject'] == '(no subject)'
+
 
 class TestIterNewMessagesManualAdvance:
     def test_manual_save_required(self, tmp_path: Path) -> None:
@@ -389,6 +419,38 @@ class TestNewEpochRollover:
         assert len(got) == 1
         assert got[0][0] == 1
         assert b'msg-1' in got[0][2]
+
+    def test_non_contiguous_new_epoch(self, tmp_path: Path) -> None:
+        """Public-inbox allows arbitrary epoch numbering -- a new epoch
+        numbered 2 (with no epoch 1 in between) must still be picked up."""
+        v2path = tmp_path / 'inbox'
+        ezpi.add_rfc822_v2(str(v2path), _make_msg(0))
+        assert list(ezpi.iter_new_messages(str(v2path), 'foo', auto_advance=True)) == []
+        # Jump straight to epoch 2, skipping 1.
+        ezpi.init_epoch(str(v2path), 2)
+        ezpi.add_rfc822(str(v2path / 'git' / '2.git'), _make_msg(100))
+        got = list(ezpi.iter_new_messages(str(v2path), 'foo', auto_advance=True))
+        assert len(got) == 1
+        assert got[0][0] == 2
+        assert b'msg-100@example.com' in got[0][2]
+
+    def test_multiple_new_epochs_walked_in_order(self, tmp_path: Path) -> None:
+        """When several epochs materialize between calls, all are walked in
+        order -- unlike korgalore, which only picks up the highest (see
+        pi_feed.py:341-347). Here we guarantee no messages are skipped."""
+        v2path = tmp_path / 'inbox'
+        ezpi.add_rfc822_v2(str(v2path), _make_msg(0))
+        assert list(ezpi.iter_new_messages(str(v2path), 'foo', auto_advance=True)) == []
+        for ep in (1, 2, 3):
+            ezpi.init_epoch(str(v2path), ep)
+            ezpi.add_rfc822(str(v2path / 'git' / f'{ep}.git'), _make_msg(ep * 10))
+        got = list(ezpi.iter_new_messages(str(v2path), 'foo', auto_advance=True))
+        assert [m[0] for m in got] == [1, 2, 3]
+        assert [b'msg-10@example.com' in m[2] for m in got] == [True, False, False]
+        assert [b'msg-20@example.com' in m[2] for m in got] == [False, True, False]
+        assert [b'msg-30@example.com' in m[2] for m in got] == [False, False, True]
+        # Re-run yields nothing (all three epochs are now at HEAD in state).
+        assert list(ezpi.iter_new_messages(str(v2path), 'foo', auto_advance=True)) == []
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +571,64 @@ class TestRebaseRecovery:
         ezpi.init_v2_inbox(str(v2path))
         with pytest.raises(ezpi.CursorStateError):
             ezpi.recover_cursor(str(v2path), 'foo', 0)
+
+    def test_recovery_skips_noops_in_candidate_window(self, tmp_path: Path) -> None:
+        """The candidate walk must ``continue`` past noop commits (no ``m``
+        blob) before matching on (subject, msgid). Constructs a rewritten
+        history whose first candidate is a noop and whose second candidate
+        is the replay of the cursored message."""
+        v2path = tmp_path / 'inbox'
+        messages = [_make_msg(i) for i in range(3)]
+        for m in messages:
+            ezpi.add_rfc822_v2(str(v2path), m)
+        # Save cursor at msg 0 (stored subject='Test message 0').
+        all_msgs = list(ezpi.iter_messages(str(v2path)))
+        ezpi.save_cursor(str(v2path), 'foo', *all_msgs[0])
+        # Rewrite: noop, then replay of msgs 0, 1, 2.
+        epoch_path = str(v2path / 'git' / '0.git')
+        ezpi.git_run_command(epoch_path, ['update-ref', '-d', ezpi.PI_HEAD])
+        _append_noop_commit(epoch_path)
+        for mb in messages:
+            env = {
+                'GIT_COMMITTER_NAME': 'Rewriter',
+                'GIT_COMMITTER_EMAIL': 'rewriter@example.com',
+                'GIT_COMMITTER_DATE': formatdate(),
+            }
+            ezpi.add_rfc822(epoch_path, mb, env=env)
+        # Recovery walks candidates in order, skips the noop, then matches
+        # msg 0's replay and resumes yielding msg 1 and msg 2.
+        got = list(ezpi.iter_new_messages(str(v2path), 'foo', auto_advance=True))
+        msgids = [b.split(b'Message-Id: ')[1].split(b'\n')[0] for _, _, b in got]
+        assert msgids == [b'<msg-1@example.com>', b'<msg-2@example.com>']
+
+    def test_recovery_all_candidates_are_noops(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """If every commit at or after the stored commit_date is a noop,
+        recovery can't find an exact match and falls back to
+        ``candidates[0]`` -- which itself is a noop, so the saved entry
+        carries the msgid/subject sentinels."""
+        v2path = tmp_path / 'inbox'
+        ezpi.add_rfc822_v2(str(v2path), _make_msg(0))
+        ezpi.add_rfc822_v2(str(v2path), _make_msg(1))
+        # Save cursor at msg 1 (stored subject='Test message 1').
+        all_msgs = list(ezpi.iter_messages(str(v2path)))
+        ezpi.save_cursor(str(v2path), 'foo', *all_msgs[1])
+        # Wipe history and replace with three noop commits.
+        epoch_path = str(v2path / 'git' / '0.git')
+        ezpi.git_run_command(epoch_path, ['update-ref', '-d', ezpi.PI_HEAD])
+        _append_noop_commit(epoch_path)
+        _append_noop_commit(epoch_path)
+        _append_noop_commit(epoch_path)
+        with caplog.at_level('WARNING', logger='ezpi'):
+            got = list(ezpi.iter_new_messages(str(v2path), 'foo', auto_advance=True))
+        # Nothing can be yielded (stored msgid is gone and the tail is all noops).
+        assert got == []
+        assert any('no exact match after rebase' in rec.message for rec in caplog.records)
+        # Recovered cursor points into the noop chain with sentinel headers.
+        state = ezpi.load_cursor(str(v2path), 'foo')
+        assert state is not None
+        entry = state['epochs']['0']
+        assert entry['msgid'] == '(no message-id)'
+        assert entry['subject'] == '(no subject)'
 
 
 # ---------------------------------------------------------------------------
@@ -638,6 +758,38 @@ class TestBatchCatFile:
                 break
             time.sleep(0.05)
         assert _count_git_children() <= before, 'cat-file --batch subprocess leaked'
+
+    def test_reads_large_blob_intact(self, tmp_path: Path) -> None:
+        """Batch framing uses the header's ``size`` field and must loop on
+        short reads. Payloads larger than one pipe buffer (~64 KiB on
+        Linux) would truncate if the read were a single non-looping call."""
+        v2path = tmp_path / 'inbox'
+        big_body = 'X' * (2 * 1024 * 1024)  # 2 MiB -- well past any pipe buffer
+        msg = (
+            'From: Sender <sender@example.com>\n'
+            'Subject: Big message\n'
+            'Message-Id: <big@example.com>\n'
+            'Date: Mon, 01 Jan 2024 12:00:00 +0000\n'
+            '\n'
+            f'{big_body}\n'
+        ).encode()
+        ezpi.add_rfc822_v2(str(v2path), msg)
+        got = list(ezpi.iter_messages(str(v2path)))
+        assert len(got) == 1
+        _epoch, _commit, body = got[0]
+        # The full 2 MiB payload must round-trip intact.
+        assert b'X' * (2 * 1024 * 1024) in body
+        # And the framing trailer must have been consumed -- if it hadn't,
+        # a follow-up read through the same pipe would desync. Verify by
+        # doing a second read against the same batch session.
+        gitdir = str(v2path / 'git' / '0.git')
+        with ezpi._BatchCatFile(gitdir) as cf:
+            first = cf.read(f'{_commit}:m')
+            assert first is not None and len(first) > 2 * 1024 * 1024
+            # Second read on the same pipe -- must still be aligned.
+            second = cf.read(f'{_commit}^{{commit}}')
+            assert second is not None
+            assert second.startswith(b'tree ')
 
 
 # ---------------------------------------------------------------------------
