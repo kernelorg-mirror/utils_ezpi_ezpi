@@ -1,18 +1,23 @@
-EZPI: a simple library to write to public-inbox repos
-=====================================================
-This is a very simple library that allows writing to public-inbox v2
+EZPI: a simple library to read and write public-inbox repos
+===========================================================
+This is a small library for reading and writing public-inbox v2
 repositories. Note, that this is not a suitable replacement for
-public-inbox in itself -- the goal is merely to provide a way to write
-public-inbox repositories that can be cloned, indexed and served from an
-actual public-inbox server running elsewhere.
+public-inbox in itself -- the goal is merely to provide a way to
+produce and consume public-inbox repositories that can be cloned,
+indexed and served from an actual public-inbox server running elsewhere.
 
 What it does:
 
 - adds RFC2822 messages to git repositories compatible with public-inbox
 - supports public-inbox v2 format with automatic epoch management
+- reads messages out of a local public-inbox v2 repository using named
+  cursors, with automatic rebase recovery
 
 What it doesn't do:
 
+- fetch, clone, or otherwise synchronize with remote repositories
+  (use ``git``, ``lei``, or ``rsync`` for that)
+- parse messages (bytes in, bytes out)
 - anything else
 
 For the public-inbox v2 format, see:
@@ -21,7 +26,10 @@ For the public-inbox v2 format, see:
 
 Requirements
 ------------
-The ``git`` command must exist and be in your path.
+The ``git`` command must exist and be in your path. Reading features that
+rely on rebase recovery need **git 2.40 or newer** for the
+``--since-as-filter`` flag; ordinary reading and all writing work on any
+recent git.
 
 Installing
 ----------
@@ -53,6 +61,39 @@ This is the simplest usage example:
 
 You can also pass bytes instead of an EmailMessage object, but we must
 be able to run message_from_bytes() on it.
+
+Reading a public-inbox repository
+---------------------------------
+EZPI can also read messages out of a local v2 inbox that you're keeping
+in sync yourself (via ``git pull``, ``lei up``, etc). Readers identify
+themselves with a **cursor name**; EZPI remembers per-cursor where each
+reader left off.
+
+.. code-block:: python
+
+  import ezpi
+
+  # First call seeds the cursor at HEAD and yields nothing.
+  for epoch, commit, msg_bytes in ezpi.iter_new_messages('/path/to/inbox', 'myapp'):
+      pass
+
+  # After the repo is refreshed (git pull etc), new messages show up here.
+  # auto_advance=True persists cursor state after each yielded message.
+  for epoch, commit, msg_bytes in ezpi.iter_new_messages(
+      '/path/to/inbox', 'myapp', auto_advance=True
+  ):
+      handle(msg_bytes)
+
+  # Backfill the whole history instead of starting at HEAD:
+  for epoch, commit, msg_bytes in ezpi.iter_new_messages(
+      '/path/to/inbox', 'myapp', start='beginning'
+  ):
+      handle(msg_bytes)
+
+New epochs are detected automatically on every call. If the repository
+history is rewritten to delete a message, EZPI detects the stale cursor
+and transparently relocates it by matching on Message-ID, Subject, and
+commit date.
 
 ezpi command
 ------------

@@ -33,19 +33,22 @@ from __future__ import annotations
 
 __author__ = 'Konstantin Ryabitsev <konstantin@linuxfoundation.org>'
 
+import contextlib
+import datetime
 import email
 import email.header
 import email.message
 import email.policy
+import json
 import logging
 import os
 import re
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from email import charset
-from email.utils import formatdate, make_msgid, parseaddr
+from email.utils import formatdate, make_msgid, mktime_tz, parseaddr, parsedate_tz
 from fcntl import LOCK_EX, LOCK_UN, lockf
-from typing import IO
+from typing import IO, Any
 
 # Optional pygit2 support
 try:
@@ -70,7 +73,27 @@ EMLPOLICY = email.policy.EmailPolicy(utf8=True, cte_type='8bit', max_line_length
 PI_HEAD = 'refs/heads/master'
 
 # My version
-__VERSION__ = '0.5.1'
+__VERSION__ = '0.6-dev'
+
+
+class CursorError(RuntimeError):
+    """Base class for cursor-related errors."""
+
+
+class CursorStateError(CursorError):
+    """Cursor state file is missing a required field or cannot be parsed."""
+
+
+class StaleCommitError(CursorError):
+    """A ``since`` commit hash given to :func:`iter_messages` is not present
+    in the repo (history was rewritten). Carries the epoch and stored commit
+    so the cursor-aware layer can trigger recovery.
+    """
+
+    def __init__(self, epoch: int, commit: str) -> None:
+        super().__init__(f'Commit {commit} is not in epoch {epoch}')
+        self.epoch = epoch
+        self.commit = commit
 
 
 def _use_pygit2() -> bool:
@@ -123,6 +146,42 @@ def _pygit2_init_repo(path: str) -> None:
     logger.debug('Initialized bare repo at %s (pygit2)', path)
 
 
+def _parse_git_env_date(date_str: str | None) -> tuple[int, int] | None:
+    """Parse a ``GIT_*_DATE`` env-format date into ``(unix_ts, tz_minutes)``.
+
+    Accepts the two formats git itself accepts for these env vars: RFC 2822
+    (as produced by :func:`email.utils.formatdate`) and git's ``%ci`` ISO
+    form (``YYYY-MM-DD HH:MM:SS +ZZZZ``). Returns None if unparseable, in
+    which case callers should fall back to the current wall-clock time.
+    """
+    if not date_str:
+        return None
+    parsed = parsedate_tz(date_str)
+    if parsed is not None and parsed[9] is not None:
+        try:
+            return int(mktime_tz(parsed)), (parsed[9] or 0) // 60
+        except (OverflowError, ValueError):
+            pass
+    for fmt in ('%Y-%m-%d %H:%M:%S %z', '%Y-%m-%dT%H:%M:%S%z'):
+        try:
+            dt = datetime.datetime.strptime(date_str, fmt)
+        except ValueError:
+            continue
+        offset = dt.utcoffset()
+        offset_min = int(offset.total_seconds() // 60) if offset is not None else 0
+        return int(dt.timestamp()), offset_min
+    return None
+
+
+def _pygit2_signature(name: str, email_addr: str, date_str: str | None) -> Any:
+    """Build a pygit2.Signature honoring ``GIT_*_DATE`` env format if given."""
+    parsed = _parse_git_env_date(date_str)
+    if parsed is None:
+        return pygit2.Signature(name, email_addr)
+    ts, offset = parsed
+    return pygit2.Signature(name, email_addr, time=ts, offset=offset)
+
+
 def _pygit2_write_commit(repo: str, env: dict[str, str], c_msg: str, body: bytes, dest: str = 'm') -> None:
     """Create a git commit using pygit2.
 
@@ -143,14 +202,16 @@ def _pygit2_write_commit(repo: str, env: dict[str, str], c_msg: str, body: bytes
     tb.insert(dest, blob_id, 0o100644)  # GIT_FILEMODE_BLOB
     tree_id = tb.write()
 
-    # Create signatures
-    author = pygit2.Signature(
+    # Create signatures, honoring GIT_*_DATE env vars (matches subprocess path).
+    author = _pygit2_signature(
         env.get('GIT_AUTHOR_NAME', DEFAULT_NAME),
         env.get('GIT_AUTHOR_EMAIL', DEFAULT_ADDR),
+        env.get('GIT_AUTHOR_DATE'),
     )
-    committer = pygit2.Signature(
+    committer = _pygit2_signature(
         env.get('GIT_COMMITTER_NAME', DEFAULT_NAME),
         env.get('GIT_COMMITTER_EMAIL', DEFAULT_ADDR),
+        env.get('GIT_COMMITTER_DATE'),
     )
 
     # Get parent commit if exists
@@ -596,6 +657,36 @@ def get_latest_epoch(v2path: str) -> tuple[int, str]:
     return max_epoch, epoch_path
 
 
+def get_all_epochs(v2path: str) -> list[tuple[int, str]]:
+    """List all epochs in a v2 inbox, sorted ascending by epoch number.
+
+    Args:
+        v2path: Path to the v2 inbox directory.
+
+    Returns:
+        A list of (epoch_number, epoch_path) tuples. Empty if no epochs exist.
+
+    Raises:
+        FileNotFoundError: If the inbox has no git/ directory.
+    """
+    git_dir = os.path.join(v2path, 'git')
+    if not os.path.isdir(git_dir):
+        raise FileNotFoundError(f'No git directory in v2 inbox: {v2path}')
+
+    found: list[tuple[int, str]] = []
+    for entry in os.listdir(git_dir):
+        if not entry.endswith('.git'):
+            continue
+        try:
+            epoch_num = int(entry[:-4])
+        except ValueError:
+            continue
+        found.append((epoch_num, os.path.join(git_dir, entry)))
+
+    found.sort(key=lambda x: x[0])
+    return found
+
+
 def get_epoch_size(epoch_path: str) -> int:
     """Calculate the total size of a git epoch repository.
 
@@ -730,6 +821,475 @@ def add_rfc822_v2(
         if lockfh:
             lockf(lockfh, LOCK_UN)
             lockfh.close()
+
+
+# ---------------------------------------------------------------------------
+# Reading public-inbox v2 repositories
+# ---------------------------------------------------------------------------
+#
+# The design and algorithms in this section mirror korgalore's pi_feed.py
+# (https://git.kernel.org/pub/scm/utils/korg-helpers/korgalore.git). Fallback
+# choices in particular (rebase recovery, noop handling) are deliberate and
+# should not be "improved" without understanding what they trade off.
+
+# Sentinel values used when a message is missing a Subject or Message-ID.
+# These strings match korgalore's so recovery comparisons are bit-identical.
+_NO_MSGID = '(no message-id)'
+_NO_SUBJECT = '(no subject)'
+
+
+def _peek_cursor_headers(msg_bytes: bytes) -> dict[str, str]:
+    """Extract msgid+subject from raw message bytes for cursor state.
+
+    Uses the stdlib email parser with the compat32 policy (what public-inbox
+    treats as canonical). Missing fields fall back to the same sentinels
+    korgalore uses so rebase-recovery comparisons are identical.
+    """
+    msg = email.message_from_bytes(msg_bytes, policy=email.policy.compat32)
+    subject = msg.get('Subject', _NO_SUBJECT) or _NO_SUBJECT
+    msgid = msg.get('Message-ID', _NO_MSGID) or _NO_MSGID
+    return {'subject': str(subject), 'msgid': str(msgid)}
+
+
+def _commit_date(gitdir: str, commit: str) -> str:
+    """Return the committer date of ``commit`` in git's ``%ci`` format.
+
+    Format example: ``2026-04-23 14:29:50 +0000``. This is what the
+    rebase-recovery search uses as its ``--since-as-filter`` anchor.
+    """
+    retcode, out, err = git_run_command(gitdir, ['log', '-1', '--format=%ci', commit])
+    if retcode != 0:
+        raise CursorStateError(f'Could not read commit date for {commit}: {err.decode(errors="replace")}')
+    return out.decode().strip()
+
+
+def _commit_exists(gitdir: str, commit: str) -> bool:
+    """Return True if ``commit`` is present in the repo object graph."""
+    retcode, _out, _err = git_run_command(gitdir, ['cat-file', '-e', f'{commit}^{{commit}}'])
+    return retcode == 0
+
+
+def _is_on_current_history(gitdir: str, commit: str) -> bool:
+    """Return True if ``commit`` is reachable from :data:`PI_HEAD`.
+
+    We intentionally diverge from korgalore's ``cat-file -e <commit>^`` probe
+    here: that probe only fires once unreachable objects have been pruned by
+    ``git gc``, so it misses a rebase until the next maintenance sweep.
+    ``merge-base --is-ancestor`` asks the right question -- "is this hash
+    on the current history?" -- regardless of object-store state.
+    """
+    retcode, _out, _err = git_run_command(
+        gitdir, ['merge-base', '--is-ancestor', commit, PI_HEAD]
+    )
+    return retcode == 0
+
+
+def _has_m_blob(gitdir: str, commit: str) -> bool:
+    """Return True if ``commit`` contains an ``m`` blob in its tree.
+
+    Public-inbox v2 writes messages as the ``m`` file and uses commits
+    without ``m`` (or with a ``d`` file instead) for deletion/purge markers.
+    """
+    retcode, _out, _err = git_run_command(gitdir, ['cat-file', '-e', f'{commit}:m'])
+    return retcode == 0
+
+
+def _read_m_blob(gitdir: str, commit: str) -> bytes:
+    """Return the raw bytes of the ``m`` blob for ``commit``."""
+    retcode, out, err = git_run_command(gitdir, ['cat-file', 'blob', f'{commit}:m'])
+    if retcode != 0:
+        raise CursorError(f'Could not read m blob for {commit}: {err.decode(errors="replace")}')
+    return out
+
+
+def _top_commit(gitdir: str) -> str | None:
+    """Return the current HEAD commit hash, or None if the repo has no commits."""
+    retcode, out, _err = git_run_command(gitdir, ['rev-parse', PI_HEAD])
+    if retcode != 0:
+        return None
+    return out.decode().strip() or None
+
+
+def iter_messages(
+    v2path: str,
+    since: dict[int, str] | None = None,
+) -> Iterator[tuple[int, str, bytes]]:
+    """Yield ``(epoch, commit, raw_bytes)`` for messages in chronological order.
+
+    Walks every epoch in order, skipping no-op commits (purge/rm commits
+    without an ``m`` blob). If ``since`` is given (maps epoch number to
+    commit hash), only commits strictly after that hash are yielded in that
+    epoch. Epochs not present in ``since`` are walked from their first commit.
+
+    Args:
+        v2path: Path to the v2 inbox directory.
+        since: Optional ``{epoch: commit_hash}`` map marking a cursor
+            position per epoch.
+
+    Yields:
+        Tuples of ``(epoch_number, commit_hash, raw_rfc822_bytes)``.
+
+    Raises:
+        StaleCommitError: If a ``since`` hash is not in the repo. Carries
+            the epoch and hash so the cursor-aware layer can recover.
+        CursorError: On unexpected git failures while reading blobs.
+    """
+    if since is None:
+        since = {}
+
+    for epoch, gitdir in get_all_epochs(v2path):
+        if _top_commit(gitdir) is None:
+            # Empty epoch -- nothing to yield, and any stored cursor position
+            # for it is moot (the ref doesn't exist yet).
+            continue
+        since_commit = since.get(epoch)
+        if since_commit is not None:
+            if not _is_on_current_history(gitdir, since_commit):
+                raise StaleCommitError(epoch, since_commit)
+            revspec = f'{since_commit}..{PI_HEAD}'
+        else:
+            revspec = PI_HEAD
+
+        retcode, out, err = git_run_command(gitdir, ['rev-list', '--reverse', revspec])
+        if retcode != 0:
+            # An empty repo (no PI_HEAD yet) fails rev-parse inside rev-list;
+            # treat that as "no commits to yield" rather than an error.
+            if not _top_commit(gitdir):
+                continue
+            raise CursorError(f'git rev-list failed in epoch {epoch}: {err.decode(errors="replace")}')
+
+        commits = out.decode().splitlines()
+        for commit in commits:
+            # Must verify the commit object exists before asking about its
+            # tree -- a bad/missing object would otherwise look like a noop.
+            # (mirrors korgalore pi_feed.py:371)
+            if not _commit_exists(gitdir, commit):
+                raise CursorError(f'Commit {commit} in epoch {epoch} is not a valid object')
+            if not _has_m_blob(gitdir, commit):
+                continue
+            yield epoch, commit, _read_m_blob(gitdir, commit)
+
+
+def _cursor_path(v2path: str, cursor_name: str) -> str:
+    return os.path.join(v2path, f'ezpi-cursor.{cursor_name}.json')
+
+
+def load_cursor(v2path: str, cursor_name: str) -> dict[str, Any] | None:
+    """Load cursor state for ``cursor_name``, or None if no state exists.
+
+    Args:
+        v2path: Path to the v2 inbox directory.
+        cursor_name: The cursor identifier.
+
+    Returns:
+        A dict with the cursor state, or None if the cursor has never been
+        saved.
+
+    Raises:
+        CursorStateError: If the cursor file exists but cannot be parsed.
+    """
+    path = _cursor_path(v2path, cursor_name)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CursorStateError(f'Could not read cursor {cursor_name}: {exc}') from exc
+    if not isinstance(data, dict):
+        raise CursorStateError(f'Cursor {cursor_name} is not a JSON object')
+    return data
+
+
+def _write_cursor(v2path: str, cursor_name: str, data: dict[str, Any]) -> None:
+    """Atomically write cursor state to disk, holding an exclusive lock.
+
+    The lock is per-cursor-file (not per-inbox) so writers for different
+    cursors never block each other.
+    """
+    path = _cursor_path(v2path, cursor_name)
+    os.makedirs(v2path, exist_ok=True)
+    lock_path = path + '.lock'
+    lockfh: IO[str] | None = None
+    try:
+        lockfh = open(lock_path, 'w')  # noqa: SIM115
+        lockf(lockfh, LOCK_EX)
+        tmp_path = path + '.tmp'
+        with open(tmp_path, 'w') as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+        os.replace(tmp_path, path)
+    finally:
+        if lockfh is not None:
+            lockf(lockfh, LOCK_UN)
+            lockfh.close()
+
+
+def save_cursor(
+    v2path: str,
+    cursor_name: str,
+    epoch: int,
+    commit: str,
+    msg_bytes: bytes,
+) -> None:
+    """Persist a cursor position after processing a message.
+
+    Stores msgid+subject (extracted from ``msg_bytes``) and the committer
+    date of ``commit``; all three are required for rebase recovery.
+
+    Args:
+        v2path: Path to the v2 inbox directory.
+        cursor_name: The cursor identifier.
+        epoch: The epoch containing ``commit``.
+        commit: The commit hash just processed.
+        msg_bytes: The raw message bytes yielded for that commit.
+    """
+    gitdir = os.path.join(v2path, 'git', f'{epoch}.git')
+    headers = _peek_cursor_headers(msg_bytes)
+    commit_date = _commit_date(gitdir, commit)
+
+    existing = load_cursor(v2path, cursor_name) or {}
+    raw_epochs = existing.get('epochs', {})
+    epochs: dict[str, Any] = dict(raw_epochs) if isinstance(raw_epochs, dict) else {}
+    epochs[str(epoch)] = {
+        'commit': commit,
+        'msgid': headers['msgid'],
+        'subject': headers['subject'],
+        'commit_date': commit_date,
+    }
+    data = {
+        'cursor': cursor_name,
+        'updated': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
+        'epochs': epochs,
+    }
+    _write_cursor(v2path, cursor_name, data)
+
+
+def reset_cursor(v2path: str, cursor_name: str) -> None:
+    """Delete the cursor state file. No-op if it doesn't exist."""
+    path = _cursor_path(v2path, cursor_name)
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(path)
+
+
+def _save_cursor_raw(
+    v2path: str,
+    cursor_name: str,
+    per_epoch: dict[int, dict[str, str]],
+) -> None:
+    """Write cursor state from a fully-assembled per-epoch dict.
+
+    Used by first-use initialization and recovery, where we don't have a
+    single ``(commit, msg_bytes)`` pair to save but a full snapshot.
+    """
+    data = {
+        'cursor': cursor_name,
+        'updated': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
+        'epochs': {str(k): v for k, v in per_epoch.items()},
+    }
+    _write_cursor(v2path, cursor_name, data)
+
+
+def recover_cursor(v2path: str, cursor_name: str, epoch: int) -> str:
+    """Re-locate a cursor's stored commit after history was rewritten.
+
+    Uses the stored ``commit_date`` to anchor a ``--since-as-filter`` search,
+    then matches on ``(subject, msgid)``. Mirrors korgalore's algorithm
+    (pi_feed.py:248-303) including its fallback choices:
+
+    - If ``rev-list`` itself errors, fast-forward to the current top commit.
+    - If ``rev-list`` yields no candidates, save state at the top commit.
+    - If no candidate matches the stored headers, fall back to the **first**
+      candidate after the date (logged as a warning). Trades possible-skip
+      for small re-delivery risk.
+
+    Args:
+        v2path: Path to the v2 inbox directory.
+        cursor_name: The cursor identifier.
+        epoch: The epoch whose stored position needs recovery.
+
+    Returns:
+        The new commit hash, also written back into the cursor file.
+
+    Raises:
+        CursorStateError: If there is no stored state for ``epoch`` or
+            required fields are missing.
+    """
+    state = load_cursor(v2path, cursor_name)
+    if state is None:
+        raise CursorStateError(f'Cursor {cursor_name} has no saved state')
+    epochs_state = state.get('epochs', {})
+    if not isinstance(epochs_state, dict) or str(epoch) not in epochs_state:
+        raise CursorStateError(f'No state for epoch {epoch} in cursor {cursor_name}')
+    info = epochs_state[str(epoch)]
+    stored_msgid = info.get('msgid')
+    stored_subject = info.get('subject')
+    commit_date = info.get('commit_date')
+    if not commit_date:
+        raise CursorStateError(f'Cursor {cursor_name} has no commit_date for epoch {epoch} (cannot recover)')
+
+    gitdir = os.path.join(v2path, 'git', f'{epoch}.git')
+
+    def _fast_forward(reason: str) -> str:
+        top = _top_commit(gitdir)
+        if top is None:
+            # Epoch is empty -- drop any stale state we had for it.
+            fresh = {int(k): v for k, v in epochs_state.items() if k != str(epoch)}
+            _save_cursor_raw(v2path, cursor_name, fresh)
+            raise CursorStateError(
+                f'Cannot recover cursor {cursor_name} for epoch {epoch}: {reason} and epoch is empty'
+            )
+        logger.warning('Cursor %s epoch %d: %s, fast-forwarding to %s', cursor_name, epoch, reason, top)
+        new_epochs = {int(k): dict(v) for k, v in epochs_state.items()}
+        new_epochs[epoch] = {
+            'commit': top,
+            'msgid': _peek_cursor_headers(_read_m_blob(gitdir, top))['msgid']
+            if _has_m_blob(gitdir, top) else _NO_MSGID,
+            'subject': _peek_cursor_headers(_read_m_blob(gitdir, top))['subject']
+            if _has_m_blob(gitdir, top) else _NO_SUBJECT,
+            'commit_date': _commit_date(gitdir, top),
+        }
+        _save_cursor_raw(v2path, cursor_name, new_epochs)
+        return top
+
+    retcode, out, _err = git_run_command(
+        gitdir, ['rev-list', '--reverse', '--since-as-filter', commit_date, PI_HEAD]
+    )
+    if retcode != 0:
+        return _fast_forward('rev-list failed during recovery')
+
+    candidates = out.decode().splitlines()
+    if not candidates:
+        return _fast_forward('no commits at or after stored commit_date')
+
+    matched: str | None = None
+    for candidate in candidates:
+        if not _has_m_blob(gitdir, candidate):
+            continue
+        headers = _peek_cursor_headers(_read_m_blob(gitdir, candidate))
+        if headers['subject'] == stored_subject and headers['msgid'] == stored_msgid:
+            matched = candidate
+            break
+
+    chosen: str
+    chosen_headers: dict[str, str]
+    if matched is not None:
+        chosen = matched
+        chosen_headers = _peek_cursor_headers(_read_m_blob(gitdir, chosen))
+        logger.debug('Cursor %s epoch %d: recovered exact match at %s', cursor_name, epoch, chosen)
+    else:
+        chosen = candidates[0]
+        if _has_m_blob(gitdir, chosen):
+            chosen_headers = _peek_cursor_headers(_read_m_blob(gitdir, chosen))
+        else:
+            chosen_headers = {'subject': _NO_SUBJECT, 'msgid': _NO_MSGID}
+        logger.warning(
+            'Cursor %s epoch %d: no exact match after rebase, resuming at first '
+            'candidate %s (may skip or re-deliver)',
+            cursor_name, epoch, chosen,
+        )
+
+    new_epochs = {int(k): dict(v) for k, v in epochs_state.items()}
+    new_epochs[epoch] = {
+        'commit': chosen,
+        'msgid': chosen_headers['msgid'],
+        'subject': chosen_headers['subject'],
+        'commit_date': _commit_date(gitdir, chosen),
+    }
+    _save_cursor_raw(v2path, cursor_name, new_epochs)
+    return chosen
+
+
+def iter_new_messages(
+    v2path: str,
+    cursor_name: str,
+    auto_advance: bool = False,
+    start: str = 'head',
+) -> Iterator[tuple[int, str, bytes]]:
+    """Yield messages the named cursor has not seen yet.
+
+    On first use (no cursor file exists), behavior depends on ``start``:
+
+    - ``'head'`` (default): advance cursor to the current HEAD of every
+      epoch and yield nothing. The caller will only see messages added
+      after this first call.
+    - ``'beginning'``: walk the entire history from the oldest commit.
+
+    New epochs appearing after the cursor was saved are walked from their
+    first commit automatically.
+
+    If a stored commit hash has been rewritten away (rebase), this function
+    transparently invokes :func:`recover_cursor` and resumes. Recovery always
+    succeeds by falling through to the top commit in the worst case.
+
+    Args:
+        v2path: Path to the v2 inbox directory.
+        cursor_name: The cursor identifier.
+        auto_advance: If True, persist cursor state automatically after each
+            yielded message. If False, caller must call :func:`save_cursor`.
+        start: First-use policy, ``'head'`` or ``'beginning'``.
+
+    Yields:
+        Tuples of ``(epoch_number, commit_hash, raw_rfc822_bytes)``.
+
+    Raises:
+        ValueError: If ``start`` is neither ``'head'`` nor ``'beginning'``.
+    """
+    if start not in ('head', 'beginning'):
+        raise ValueError(f"start must be 'head' or 'beginning', got {start!r}")
+
+    state = load_cursor(v2path, cursor_name)
+    if state is None:
+        # First use: set cursor based on `start` policy.
+        if start == 'head':
+            _initialize_cursor_at_head(v2path, cursor_name)
+            return
+        # 'beginning': fall through with no `since` dict -> walk everything.
+        since: dict[int, str] = {}
+    else:
+        epochs_state = state.get('epochs', {})
+        since = {}
+        if isinstance(epochs_state, dict):
+            for k, v in epochs_state.items():
+                try:
+                    since[int(k)] = v['commit']
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+    while True:
+        try:
+            for epoch, commit, msg_bytes in iter_messages(v2path, since=since):
+                yield epoch, commit, msg_bytes
+                if auto_advance:
+                    save_cursor(v2path, cursor_name, epoch, commit, msg_bytes)
+                    since[epoch] = commit
+            return
+        except StaleCommitError as exc:
+            # A stored hash is gone; recover this epoch and restart iteration.
+            # Recovery updates state on disk; refresh our local `since` map
+            # so already-yielded epochs keep their position.
+            recovered = recover_cursor(v2path, cursor_name, exc.epoch)
+            since[exc.epoch] = recovered
+            continue
+
+
+def _initialize_cursor_at_head(v2path: str, cursor_name: str) -> None:
+    """Seed a brand-new cursor at the HEAD of every existing epoch."""
+    per_epoch: dict[int, dict[str, str]] = {}
+    for epoch, gitdir in get_all_epochs(v2path):
+        top = _top_commit(gitdir)
+        if top is None:
+            continue
+        if _has_m_blob(gitdir, top):
+            headers = _peek_cursor_headers(_read_m_blob(gitdir, top))
+        else:
+            headers = {'subject': _NO_SUBJECT, 'msgid': _NO_MSGID}
+        per_epoch[epoch] = {
+            'commit': top,
+            'msgid': headers['msgid'],
+            'subject': headers['subject'],
+            'commit_date': _commit_date(gitdir, top),
+        }
+    _save_cursor_raw(v2path, cursor_name, per_epoch)
 
 
 def command() -> None:

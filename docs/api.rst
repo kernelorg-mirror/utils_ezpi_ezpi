@@ -25,6 +25,43 @@ v2 Format Functions
 
 .. autofunction:: ezpi.should_rotate_epoch
 
+Reading Functions
+-----------------
+
+These functions let you consume messages out of a v2 inbox that you (or
+someone else) is keeping up to date. EZPI itself never fetches from
+remotes -- refresh the local checkout with ``git pull``, ``lei up``, etc.
+before calling these.
+
+.. autofunction:: ezpi.iter_new_messages
+
+.. autofunction:: ezpi.iter_messages
+
+.. autofunction:: ezpi.get_all_epochs
+
+Cursor State
+^^^^^^^^^^^^
+
+Named cursors track per-reader position. EZPI stores one JSON file per
+cursor alongside the inbox, at ``{v2path}/ezpi-cursor.{name}.json``.
+
+.. autofunction:: ezpi.load_cursor
+
+.. autofunction:: ezpi.save_cursor
+
+.. autofunction:: ezpi.reset_cursor
+
+.. autofunction:: ezpi.recover_cursor
+
+Reading Exceptions
+^^^^^^^^^^^^^^^^^^
+
+.. autoexception:: ezpi.CursorError
+
+.. autoexception:: ezpi.CursorStateError
+
+.. autoexception:: ezpi.StaleCommitError
+
 Utility Functions
 -----------------
 
