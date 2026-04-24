@@ -28,6 +28,8 @@ v2 Format Functions
 Reading Functions
 -----------------
 
+.. versionadded:: 0.6
+
 These functions let you consume messages out of a v2 inbox that you (or
 someone else) is keeping up to date. EZPI itself never fetches from
 remotes -- refresh the local checkout with ``git pull``, ``lei up``, etc.
@@ -42,6 +44,8 @@ before calling these.
 Cursor State
 ^^^^^^^^^^^^
 
+.. versionadded:: 0.6
+
 Named cursors track per-reader position. EZPI stores one JSON file per
 cursor alongside the inbox, at ``{v2path}/ezpi-cursor.{name}.json``.
 
@@ -55,6 +59,8 @@ cursor alongside the inbox, at ``{v2path}/ezpi-cursor.{name}.json``.
 
 Reading Exceptions
 ^^^^^^^^^^^^^^^^^^
+
+.. versionadded:: 0.6
 
 .. autoexception:: ezpi.CursorError
 

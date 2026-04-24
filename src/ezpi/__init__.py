@@ -75,7 +75,7 @@ EMLPOLICY = email.policy.EmailPolicy(utf8=True, cte_type='8bit', max_line_length
 PI_HEAD = 'refs/heads/master'
 
 # My version
-__VERSION__ = '0.6-dev'
+__VERSION__ = '0.6'
 
 
 class CursorError(RuntimeError):

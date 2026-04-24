@@ -84,6 +84,8 @@ See :doc:`cli` for full CLI documentation and :doc:`v2` for v2 format details.
 Reading Messages
 ----------------
 
+.. versionadded:: 0.6
+
 EZPI can also read messages out of a public-inbox v2 repository that someone
 else has populated (for example, a local clone of ``lore.kernel.org``). EZPI
 does **not** fetch or clone remotes for you -- keep the repository up to

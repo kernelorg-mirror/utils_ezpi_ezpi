@@ -12,6 +12,7 @@ compatible git repositories. It provides both a Python API and a CLI tool.
    cli
    api
    v2
+   releases
 
 Features
 --------
@@ -21,7 +22,13 @@ Features
 - Automatic generation of missing headers (Date, Message-Id)
 - Proper handling of Unicode content and headers
 - Public-inbox v2 format support with automatic epoch management
+- Read messages from local v2 inboxes using named cursors, with automatic
+  rebase recovery
 - CLI tool for integration with shell scripts
+
+.. versionadded:: 0.6
+   Reading support via :func:`ezpi.iter_new_messages` and named cursors.
+   See :doc:`quickstart` for usage and :doc:`api` for the full reference.
 
 Installation
 ------------
