@@ -3,12 +3,17 @@
 # Copyright (C) 2020 by The Linux Foundation
 # SPDX-License-Identifier: MIT-0
 #
-"""EZPI - A library for writing RFC2822 messages to public-inbox repositories.
+"""EZPI - A library for reading and writing RFC2822 messages in public-inbox repositories.
 
 This module provides functions to add email messages to public-inbox v2
-format repositories. Messages can be provided as raw bytes or
-email.message.Message objects. The v2 inbox structure is created
-automatically and epochs are rotated based on size or annual boundaries.
+format repositories and to consume them back out again. For writing,
+messages can be provided as raw bytes or email.message.Message objects;
+the v2 inbox structure is created automatically and epochs are rotated
+based on size or annual boundaries. For reading, named cursors track
+per-reader position across epochs with automatic new-epoch detection
+and rebase recovery. EZPI itself never fetches from remotes -- refresh
+the local checkout with git, lei, rsync, or whatever tool fits your
+workflow.
 
 Example usage::
 
@@ -28,6 +33,12 @@ Example usage::
 
     # Use annual epoch rotation (new epoch each January)
     ezpi.add_rfc822_v2('/path/to/inbox', msg, auto_epoch='annual')
+
+    # Read new messages since the last call for a named cursor
+    for epoch, commit, msg_bytes in ezpi.iter_new_messages(
+        '/path/to/inbox', 'myapp', auto_advance=True,
+    ):
+        process(msg_bytes)
 """
 
 from __future__ import annotations
