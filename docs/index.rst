@@ -43,7 +43,7 @@ For library usage, install with pip::
 
 Or install from source::
 
-    git clone https://sr.ht/~monsieuricon/ezpi/
+    git clone https://git.kernel.org/pub/scm/utils/ezpi/ezpi.git
     cd ezpi
     pip install .
 
@@ -66,6 +66,12 @@ Quick Example
         authorname='Sender',
         authoremail='sender@example.com',
     )
+
+Getting help
+------------
+
+To report a problem or suggest a feature, please send plaintext email to
+tools@kernel.org.
 
 License
 -------
