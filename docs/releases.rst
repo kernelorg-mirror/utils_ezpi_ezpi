@@ -1,6 +1,57 @@
 Release notes
 =============
 
+.. _release-0.7.0:
+
+v0.7.0
+------
+
+This release makes writes safe when several writers work on the same
+inbox at the same time. There is no new API.
+
+Locking that works with public-inbox
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+ezpi now locks ``inbox.lock``, the per-epoch ``ezpi.lock`` and the
+cursor locks with ``flock(2)``. Before, it used ``lockf(3)``. On Linux,
+the two kinds of lock never block each other, so an ezpi write could
+run at the same time as ``public-inbox-index`` or
+``public-inbox-purge``. ``lockf(3)`` locks also belong to the whole
+process, so two threads writing to the same inbox did not wait for
+each other. Both problems are now fixed.
+
+.. warning::
+
+   An ezpi 0.6 writer and an ezpi 0.7.0 writer do not lock each other
+   out. If more than one program writes to the same inbox, upgrade all
+   of them together.
+
+Safe creation of new v2 inboxes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When several workers wrote the first messages of a new inbox at the
+same time, most of them failed with ``FileNotFoundError``. ezpi now
+builds a new inbox under a temporary ``.ezpi-init-*`` name next to the
+target and renames it into place, so other writers never see a
+half-made inbox.
+
+If the inbox cannot be created, ezpi now raises ``RuntimeError``, as
+documented, instead of a bare ``OSError``. If you caught ``OSError``
+for this case, catch ``RuntimeError`` instead.
+
+Other notable changes
+~~~~~~~~~~~~~~~~~~~~~
+
+- **Post-commit hook for v2 inboxes** -- the CLI used to ignore
+  ``--run-post-commit-hook`` together with ``--v2-path``. It now runs
+  ``<inbox>/hooks/post-commit`` with the inbox as the working
+  directory. The hook lives in the inbox, not in an epoch, so it keeps
+  working when a new epoch is created. See :doc:`cli`.
+- **No more leaked file descriptors** -- lock files and the pipes of
+  ``git cat-file`` are now always closed. Callers that run their tests
+  with ``-W error`` no longer see ``ResourceWarning``, and long-running
+  writers no longer risk running out of file descriptors.
+
 .. _release-0.6:
 
 v0.6
