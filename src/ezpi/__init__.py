@@ -56,11 +56,11 @@ import logging
 import os
 import re
 import subprocess
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Iterator, Sequence
 from email import charset
 from email.utils import formatdate, make_msgid, mktime_tz, parseaddr, parsedate_tz
-from fcntl import LOCK_EX, LOCK_UN, lockf
-from typing import IO, Any
+from fcntl import LOCK_EX, lockf
+from typing import Any
 
 # Optional pygit2 support
 try:
@@ -287,6 +287,31 @@ def check_valid_repo(repo: str) -> None:
             raise FileNotFoundError(f'Path is not a valid bare git repository: {repo}')
 
 
+@contextlib.contextmanager
+def _exclusive_lock(path: str) -> Generator[None, None, None]:
+    """Hold an exclusive lock on ``path`` for the duration of the block.
+
+    Uses a raw descriptor rather than ``open()`` because nothing is ever
+    read from or written to the lock file; closing it also drops the lock,
+    so no separate unlock call is needed.
+
+    Raises:
+        RuntimeError: If the lock file cannot be opened or locked.
+    """
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o666)
+    except OSError as exc:
+        raise RuntimeError(f'Could not obtain an exclusive lock on {path}') from exc
+    try:
+        try:
+            lockf(fd, LOCK_EX)
+        except OSError as exc:
+            raise RuntimeError(f'Could not obtain an exclusive lock on {path}') from exc
+        yield
+    finally:
+        os.close(fd)
+
+
 def git_write_commit(repo: str, env: dict[str, str], c_msg: str, body: bytes, dest: str = 'm') -> None:
     """Create a git commit containing a single file with the given content.
 
@@ -306,16 +331,8 @@ def git_write_commit(repo: str, env: dict[str, str], c_msg: str, body: bytes, de
         RuntimeError: If any git operation fails or lock cannot be acquired.
     """
     check_valid_repo(repo)
-    # Lock the repository
-    lockfh: IO[str] | None = None
-    try:
-        # The lock shouldn't be held open for very long, so try without a timeout
-        lockfh = open(os.path.join(repo, 'ezpi.lock'), 'w')  # noqa: SIM115
-        lockf(lockfh, LOCK_EX)
-    except OSError as exc:
-        raise RuntimeError('Could not obtain an exclusive lock') from exc
-
-    try:
+    # The lock shouldn't be held open for very long, so wait without a timeout
+    with _exclusive_lock(os.path.join(repo, 'ezpi.lock')):
         if _use_pygit2():
             _pygit2_write_commit(repo, env, c_msg, body, dest)
         else:
@@ -346,8 +363,6 @@ def git_write_commit(repo: str, env: dict[str, str], c_msg: str, body: bytes, de
             ee, out, err = git_run_command(repo, ['update-ref', PI_HEAD, commit])
             if ee > 0:
                 raise RuntimeError(f'Could not update-ref in {repo}: {err.decode()}')
-    finally:
-        lockf(lockfh, LOCK_UN)
 
 
 def add_plaintext(
@@ -804,38 +819,21 @@ def add_rfc822_v2(
         ezpi.add_rfc822_v2('/path/to/inbox', email_bytes)
         ezpi.add_rfc822_v2('/path/to/inbox', msg, auto_epoch='annual')
     """
-    # Lock the inbox
-    lockfh: IO[str] | None = None
-    try:
-        if os.path.exists(v2path):
-            lockfh = open(os.path.join(v2path, 'inbox.lock'), 'w')  # noqa: SIM115
-            lockf(lockfh, LOCK_EX)
-    except OSError as exc:
-        raise RuntimeError('Could not obtain v2 inbox lock') from exc
+    # inbox.lock does not exist until init_v2_inbox() creates it, so a new
+    # inbox is created first and locked afterwards.
+    if not os.path.exists(v2path):
+        init_v2_inbox(v2path)
+    with _exclusive_lock(os.path.join(v2path, 'inbox.lock')):
+        epoch_num, epoch_path = get_latest_epoch(v2path)
 
-    try:
-        # Initialize if needed
-        if not os.path.exists(v2path):
-            epoch_path = init_v2_inbox(v2path)
-            # Re-acquire lock after init
-            lockfh = open(os.path.join(v2path, 'inbox.lock'), 'w')  # noqa: SIM115
-            lockf(lockfh, LOCK_EX)
-        else:
-            epoch_num, epoch_path = get_latest_epoch(v2path)
-
-            # Check if rotation is needed
-            if should_rotate_epoch(epoch_path, auto_epoch):
-                new_epoch = epoch_num + 1
-                epoch_path = init_epoch(v2path, new_epoch)
-                logger.info('Rotated to new epoch %d', new_epoch)
+        # Check if rotation is needed
+        if should_rotate_epoch(epoch_path, auto_epoch):
+            new_epoch = epoch_num + 1
+            epoch_path = init_epoch(v2path, new_epoch)
+            logger.info('Rotated to new epoch %d', new_epoch)
 
         # Write to the epoch
         add_rfc822(epoch_path, content, domain=domain, env=env)
-
-    finally:
-        if lockfh:
-            lockf(lockfh, LOCK_UN)
-            lockfh.close()
 
 
 # ---------------------------------------------------------------------------
@@ -963,16 +961,22 @@ class _BatchCatFile:
 
     def close(self) -> None:
         """Terminate the underlying git process. Idempotent and safe."""
-        if self._proc.poll() is not None:
-            return
-        if self._proc.stdin is not None:
-            with contextlib.suppress(OSError, ValueError):
-                self._proc.stdin.close()
-        try:
-            self._proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self._proc.kill()
-            self._proc.wait()
+        if self._proc.poll() is None:
+            # Closing stdin is what tells cat-file --batch to exit.
+            if self._proc.stdin is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    self._proc.stdin.close()
+            try:
+                self._proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait()
+        # Popen never closes its pipes on its own, even after the process
+        # has exited, so do it here regardless of how we got here.
+        for pipe in (self._proc.stdin, self._proc.stdout, self._proc.stderr):
+            if pipe is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    pipe.close()
 
     def __enter__(self) -> _BatchCatFile:
         return self
@@ -1160,18 +1164,11 @@ def _write_cursor(v2path: str, cursor_name: str, data: dict[str, Any]) -> None:
     path = _cursor_path(v2path, cursor_name)
     os.makedirs(v2path, exist_ok=True)
     lock_path = path + '.lock'
-    lockfh: IO[str] | None = None
-    try:
-        lockfh = open(lock_path, 'w')  # noqa: SIM115
-        lockf(lockfh, LOCK_EX)
+    with _exclusive_lock(lock_path):
         tmp_path = path + '.tmp'
         with open(tmp_path, 'w') as f:
             json.dump(data, f, indent=2, sort_keys=True)
         os.replace(tmp_path, path)
-    finally:
-        if lockfh is not None:
-            lockf(lockfh, LOCK_UN)
-            lockfh.close()
 
 
 def save_cursor(
