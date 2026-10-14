@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import email.message
 import fcntl
+import os
 import subprocess
 import sys
 import threading
@@ -259,6 +260,48 @@ class TestV2Locking:
         writer.join(timeout=10)
         assert not writer.is_alive()
         assert b'Body.' in get_commit_body(v2path / 'git' / '0.git')
+
+    def test_writer_arrives_during_creation(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A writer that arrives while another is creating the inbox must succeed.
+
+        The second writer starts from inside the first one's init_epoch(),
+        after the inbox directory exists but before its first epoch does:
+        the window that multi-worker services used to hit. A real race
+        hits that window too rarely to make a reliable test. The parent
+        directory does not exist yet either.
+        """
+        v2path = tmp_path / 'lists' / 'new-inbox'
+        real_init_epoch = ezpi.init_epoch
+        racer_errors: list[Exception] = []
+
+        def racer() -> None:
+            try:
+                ezpi.add_rfc822_v2(str(v2path), b'From: a@example.org\nSubject: racer\n\nhi\n')
+            except Exception as exc:
+                racer_errors.append(exc)
+
+        def init_epoch_with_racer(path: str, epoch: int) -> str:
+            monkeypatch.setattr(ezpi, 'init_epoch', real_init_epoch)
+            # A thread rather than a direct call, so a lock wrongly held
+            # during creation fails the test instead of hanging it.
+            thread = threading.Thread(target=racer)
+            thread.start()
+            thread.join(timeout=30)
+            assert not thread.is_alive(), 'racer blocked while the inbox was being created'
+            return real_init_epoch(path, epoch)
+
+        monkeypatch.setattr(ezpi, 'init_epoch', init_epoch_with_racer)
+        ezpi.add_rfc822_v2(str(v2path), b'From: a@example.org\nSubject: first\n\nhi\n')
+
+        assert racer_errors == []
+        result = subprocess.run(
+            ['git', '--git-dir', str(v2path / 'git' / '0.git'), 'log', '--format=%s'],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert sorted(result.stdout.split()) == ['first', 'racer']
+        assert os.listdir(tmp_path / 'lists') == ['new-inbox'], 'temporary inbox left behind'
 
 
 class TestV2Cli:

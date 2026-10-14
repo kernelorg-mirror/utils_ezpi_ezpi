@@ -104,6 +104,10 @@ lock that public-inbox's own writers take, so ezpi waits for them and
 they wait for ezpi. Individual epoch writes also use per-epoch
 ``ezpi.lock`` files. Both locks also work between threads of one process.
 
+A new inbox is built under a temporary ``.ezpi-init-*`` name next to its
+final path and then renamed into place, so several processes can safely
+write the first messages of a new inbox at the same time.
+
 Compatibility
 -------------
 

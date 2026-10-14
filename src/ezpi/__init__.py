@@ -55,7 +55,9 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 from collections.abc import Generator, Iterator, Sequence
 from email import charset
 from email.utils import formatdate, make_msgid, mktime_tz, parseaddr, parsedate_tz
@@ -658,7 +660,7 @@ def init_v2_inbox(v2path: str) -> str:
     # Create first epoch (this also sets up alternates)
     epoch_path = init_epoch(v2path, 0)
 
-    logger.info('Initialized v2 inbox at %s', v2path)
+    logger.debug('Initialized v2 inbox at %s', v2path)
     return epoch_path
 
 
@@ -801,6 +803,38 @@ def should_rotate_epoch(epoch_path: str, mode: str) -> bool:
     return False
 
 
+def _create_v2_inbox(v2path: str) -> None:
+    """Create a v2 inbox so that no other process ever sees it half-made.
+
+    Several writers (e.g. webhook workers) can find the inbox missing at
+    the same time. inbox.lock cannot make them wait, because it lives
+    inside the inbox. So each writer builds its own copy next to the
+    target and renames it into place. rename(2) is atomic, and it fails
+    when the target is a non-empty directory, so exactly one copy wins
+    and the others use it. The all.git alternates are relative paths, so
+    moving the inbox does not break them.
+    """
+    parent = os.path.dirname(os.path.abspath(v2path))
+    os.makedirs(parent, exist_ok=True)
+    # Same parent directory, because rename(2) is only atomic within one
+    # filesystem. A killed writer leaves only this directory behind, never
+    # a half-made inbox at v2path.
+    tmpdir = tempfile.mkdtemp(dir=parent, prefix='.ezpi-init-')
+    try:
+        tmp_inbox = os.path.join(tmpdir, 'inbox')
+        init_v2_inbox(tmp_inbox)
+        try:
+            os.rename(tmp_inbox, v2path)
+        except OSError:
+            if not os.path.isdir(v2path):
+                raise
+            logger.debug('Another writer created %s first, using it', v2path)
+        else:
+            logger.info('Initialized v2 inbox at %s', v2path)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def add_rfc822_v2(
     v2path: str,
     content: email.message.Message | bytes,
@@ -822,19 +856,24 @@ def add_rfc822_v2(
 
     Raises:
         ValueError: If the message is missing required headers.
-        RuntimeError: If any git operation fails or lock cannot be acquired.
+        RuntimeError: If any git operation fails, the lock cannot be
+            acquired, or the inbox cannot be created or has no epochs.
 
     Example::
 
         ezpi.add_rfc822_v2('/path/to/inbox', email_bytes)
         ezpi.add_rfc822_v2('/path/to/inbox', msg, auto_epoch='annual')
     """
-    # inbox.lock does not exist until init_v2_inbox() creates it, so a new
-    # inbox is created first and locked afterwards.
     if not os.path.exists(v2path):
-        init_v2_inbox(v2path)
+        try:
+            _create_v2_inbox(v2path)
+        except OSError as exc:
+            raise RuntimeError(f'Could not create v2 inbox at {v2path}') from exc
     with _exclusive_lock(os.path.join(v2path, 'inbox.lock')):
-        epoch_num, epoch_path = get_latest_epoch(v2path)
+        try:
+            epoch_num, epoch_path = get_latest_epoch(v2path)
+        except FileNotFoundError as exc:
+            raise RuntimeError(str(exc)) from exc
 
         # Check if rotation is needed
         if should_rotate_epoch(epoch_path, auto_epoch):
