@@ -5,6 +5,7 @@ from __future__ import annotations
 import email.message
 import fcntl
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -258,3 +259,30 @@ class TestV2Locking:
         writer.join(timeout=10)
         assert not writer.is_alive()
         assert b'Body.' in get_commit_body(v2path / 'git' / '0.git')
+
+
+class TestV2Cli:
+    """Tests for the ezpi command with --v2-path."""
+
+    def test_runs_inbox_post_commit_hook(self, tmp_path: Path) -> None:
+        """--run-post-commit-hook runs <inbox>/hooks/post-commit in the inbox.
+
+        The hook lives in the inbox, not in an epoch, so that rotation
+        (which creates a fresh epoch with git init) does not lose it.
+        """
+        v2path = tmp_path / 'hook-inbox'
+        ezpi.init_v2_inbox(str(v2path))
+        marker = tmp_path / 'hook-ran'
+        hook = v2path / 'hooks' / 'post-commit'
+        hook.parent.mkdir()
+        hook.write_text(f'#!/bin/sh\npwd > {marker}\n')
+        hook.chmod(0o755)
+
+        subprocess.run(
+            [sys.executable, '-c', 'import ezpi; ezpi.command()', '--v2-path', str(v2path), '-p', '--rfc822'],
+            input=b'From: Test <test@example.com>\nSubject: Hook\n\nBody.\n',
+            check=True,
+            capture_output=True,
+        )
+
+        assert marker.read_text().strip() == str(v2path)

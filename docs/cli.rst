@@ -54,7 +54,11 @@ Other Options
     Domain to use when generating Message-Id headers.
 
 ``-p``, ``--run-post-commit-hook``
-    Run ``hooks/post-commit`` after a successful commit, if present.
+    Run ``hooks/post-commit`` after a successful commit, if present and
+    executable. The hook runs with the repository as its working
+    directory. For ``--v2-path``, the hook lives in the inbox directory
+    (``<inbox>/hooks/post-commit``), not in an epoch, so it keeps working
+    when a new epoch is created.
 
 ``-d``, ``--dry-run``
     Do not write the commit, just show what would be written.

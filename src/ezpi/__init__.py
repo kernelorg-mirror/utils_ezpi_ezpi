@@ -544,8 +544,13 @@ def add_rfc822(
 def run_hook(repo: str) -> None:
     """Run the post-commit hook if it exists and is executable.
 
+    The hook is ``hooks/post-commit`` inside ``repo`` and runs with
+    ``repo`` as its working directory.
+
     Args:
-        repo: Path to the bare git repository.
+        repo: Path to the bare git repository, or to the v2 inbox
+            directory. A v2 inbox keeps its hook at the inbox level, so
+            that it survives epoch rotation.
     """
     hookpath = os.path.join(repo, 'hooks', 'post-commit')
     if os.access(hookpath, os.X_OK):
@@ -1497,7 +1502,7 @@ def command() -> None:
         action='store_true',
         dest='runhook',
         default=False,
-        help='Run hooks/post-commit after a successful commit (if present)',
+        help='Run hooks/post-commit in the repo or v2 inbox after a successful commit (if present)',
     )
     parser.add_argument('--domain', default=None, help='Domain to use when creating message-ids')
 
@@ -1544,8 +1549,8 @@ def command() -> None:
         except (ValueError, RuntimeError, FileExistsError) as ex:
             logger.critical('ERROR: %s', ex)
             sys.exit(1)
-        if _args.runhook and _args.repo:
-            run_hook(_args.repo)
+        if _args.runhook:
+            run_hook(_args.v2path or _args.repo)
         return
 
     if not _args.hdr_from or not _args.hdr_subj:
@@ -1570,8 +1575,8 @@ def command() -> None:
         logger.critical('ERROR: %s', ex)
         sys.exit(1)
 
-    if _args.runhook and _args.repo:
-        run_hook(_args.repo)
+    if _args.runhook:
+        run_hook(_args.v2path or _args.repo)
 
 
 if __name__ == '__main__':
