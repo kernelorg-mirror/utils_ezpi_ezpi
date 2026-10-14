@@ -59,7 +59,7 @@ import subprocess
 from collections.abc import Generator, Iterator, Sequence
 from email import charset
 from email.utils import formatdate, make_msgid, mktime_tz, parseaddr, parsedate_tz
-from fcntl import LOCK_EX, lockf
+from fcntl import LOCK_EX, flock
 from typing import Any
 
 # Optional pygit2 support
@@ -291,6 +291,11 @@ def check_valid_repo(repo: str) -> None:
 def _exclusive_lock(path: str) -> Generator[None, None, None]:
     """Hold an exclusive lock on ``path`` for the duration of the block.
 
+    This must be flock(2), not lockf(3): public-inbox locks inbox.lock with
+    flock(2), and the two lock types never block each other on Linux. Also,
+    lockf(3) locks belong to the process, so they do not exclude other
+    threads, and closing any other descriptor of the file drops them.
+
     Uses a raw descriptor rather than ``open()`` because nothing is ever
     read from or written to the lock file; closing it also drops the lock,
     so no separate unlock call is needed.
@@ -304,7 +309,7 @@ def _exclusive_lock(path: str) -> Generator[None, None, None]:
         raise RuntimeError(f'Could not obtain an exclusive lock on {path}') from exc
     try:
         try:
-            lockf(fd, LOCK_EX)
+            flock(fd, LOCK_EX)
         except OSError as exc:
             raise RuntimeError(f'Could not obtain an exclusive lock on {path}') from exc
         yield

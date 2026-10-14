@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import email.message
+import fcntl
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -230,3 +232,29 @@ class TestAddRfc822V2:
 
         body = get_commit_body(v2path / 'git' / '0.git')
         assert b'Message object body' in body
+
+
+class TestV2Locking:
+    """Tests for the locks taken by add_rfc822_v2."""
+
+    @pytest.mark.parametrize('lockfile', ['inbox.lock', 'git/0.git/ezpi.lock'])
+    def test_waits_for_flock_holder(self, tmp_path: Path, lockfile: str) -> None:
+        """A write must wait for a flock(2) holder of either lock.
+
+        public-inbox locks inbox.lock with flock(2), so a lockf(3) lock
+        would not exclude it. The holder is a separate open() in this same
+        process, which also proves that two threads exclude each other.
+        """
+        v2path = tmp_path / 'locked-inbox'
+        ezpi.init_v2_inbox(str(v2path))
+        msg_bytes = b'From: Test <test@example.com>\nSubject: Locked\n\nBody.\n'
+        writer = threading.Thread(target=ezpi.add_rfc822_v2, args=(str(v2path), msg_bytes))
+
+        with open(v2path / lockfile, 'w') as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            writer.start()
+            writer.join(timeout=0.5)
+            assert writer.is_alive(), 'add_rfc822_v2 did not wait for the lock'
+        writer.join(timeout=10)
+        assert not writer.is_alive()
+        assert b'Body.' in get_commit_body(v2path / 'git' / '0.git')

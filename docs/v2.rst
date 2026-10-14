@@ -99,8 +99,10 @@ Locking
 -------
 
 EZPI uses ``inbox.lock`` (via ``flock(2)``) to serialize operations on
-v2 inboxes, following the public-inbox specification. Individual epoch
-writes also use per-epoch ``ezpi.lock`` files.
+v2 inboxes, following the public-inbox specification. This is the same
+lock that public-inbox's own writers take, so ezpi waits for them and
+they wait for ezpi. Individual epoch writes also use per-epoch
+``ezpi.lock`` files. Both locks also work between threads of one process.
 
 Compatibility
 -------------
