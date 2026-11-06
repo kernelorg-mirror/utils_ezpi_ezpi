@@ -113,11 +113,6 @@ reportUnknownVariableType = false
 reportPrivateUsage = false
 reportUnusedFunction = false
 
-# Optional-pygit2 pattern: pygit2 is rebound to None on ImportError so the
-# library can fall back to the subprocess backend. All real access sites are
-# guarded by _use_pygit2(), which pyright does not track.
-reportOptionalMemberAccess = false
-
 [tool.ty.src]
 # setup.py is a fallback for setuptools < 61 (no PEP 621 support); skip it
 # so ty does not need to resolve setuptools in its environment.
@@ -125,6 +120,15 @@ exclude = ["setup.py"]
 
 [tool.ty.rules]
 all = "error"
+# Overly strict rules.
+# `not value` is deliberate where an empty string or dict means the same as
+# None, e.g. an empty Date header counts as a missing one.
+truthiness-test-of-none-union = "ignore"
+# These reject `Any` from the stdlib stubs (email, subprocess) where a
+# concrete type is expected, which is a stub limitation, not a bug here.
+unsound-assignment = "ignore"
+unsound-return-statement = "ignore"
+unsound-yield = "ignore"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

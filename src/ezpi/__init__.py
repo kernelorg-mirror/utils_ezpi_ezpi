@@ -70,7 +70,9 @@ try:
 
     HAS_PYGIT2 = True
 except ImportError:
-    pygit2 = None  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
+    # The _pygit2_* helpers only run when _use_pygit2() is true, and each
+    # asserts that pygit2 is not None to tell type checkers so.
+    pygit2 = None  # type: ignore[assignment]
     HAS_PYGIT2 = False
 
 charset.add_charset('utf-8', charset.SHORTEST)
@@ -157,6 +159,7 @@ def _pygit2_init_repo(path: str) -> None:
     Args:
         path: Path where the bare repository should be created.
     """
+    assert pygit2 is not None
     pygit2.init_repository(path, bare=True)
     logger.debug('Initialized bare repo at %s (pygit2)', path)
 
@@ -190,6 +193,7 @@ def _parse_git_env_date(date_str: str | None) -> tuple[int, int] | None:
 
 def _pygit2_signature(name: str, email_addr: str, date_str: str | None) -> Any:
     """Build a pygit2.Signature honoring ``GIT_*_DATE`` env format if given."""
+    assert pygit2 is not None
     parsed = _parse_git_env_date(date_str)
     if parsed is None:
         return pygit2.Signature(name, email_addr)
@@ -207,6 +211,7 @@ def _pygit2_write_commit(repo: str, env: dict[str, str], c_msg: str, body: bytes
         body: The file content to store.
         dest: Filename for the blob in the tree.
     """
+    assert pygit2 is not None
     repository = pygit2.Repository(repo)
 
     # Create blob
@@ -259,6 +264,7 @@ def _pygit2_get_latest_commit_time(repo_path: str) -> int | None:
     Returns:
         Unix timestamp of the latest commit, or None if no commits exist.
     """
+    assert pygit2 is not None
     try:
         repository = pygit2.Repository(repo_path)
         ref = repository.references.get(PI_HEAD)
