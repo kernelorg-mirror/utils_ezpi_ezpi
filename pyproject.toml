@@ -88,7 +88,9 @@ warn_unreachable = true
 # running the suite on every supported interpreter.
 # setup.py is a fallback for setuptools < 61; exclude to avoid requiring
 # types-setuptools in the dev environment.
-exclude = ["^setup\\.py$"]
+# build/ and dist/ hold copies of the package made by setuptools, which
+# mypy would report as a duplicate "ezpi" module.
+exclude = ["^setup\\.py$", "^build/", "^dist/"]
 
 [tool.pyright]
 # pyright automatically ignores virtual environments and other directories, but
@@ -96,7 +98,8 @@ exclude = ["^setup\\.py$"]
 # https://github.com/microsoft/pyright/issues/9057#issuecomment-2366938099.
 # ".venv-*" catches the per-interpreter venvs that ci-matrix.sh leaves behind
 # (without them, pyright tries to type-check ~40 packages in each one).
-exclude = [".venv", ".venv-*", "setup.py"]
+# "build" and "dist" hold copies of the package made by setuptools.
+exclude = [".venv", ".venv-*", "build", "dist", "setup.py"]
 typeCheckingMode = "strict"
 
 # Overly strict rules.
