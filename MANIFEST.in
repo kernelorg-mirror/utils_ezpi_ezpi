@@ -1,0 +1,5 @@
+# setuptools only picks up tests/test*.py on its own, but the tests import
+# their shared fixtures and helpers from conftest.py.
+recursive-include tests *.py
+# The release notes point deployments at this file for hashed installs.
+include requirements.txt
