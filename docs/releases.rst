@@ -1,8 +1,18 @@
 Release notes
 =============
 
-Unreleased
-----------
+.. _release-0.8.0:
+
+v0.8.0
+------
+
+This release stores messages given as bytes exactly as received, so
+DKIM signatures in the archive stay valid. It also drops support for
+Python 3.9 and 3.10. There is no new API.
+
+For deployments that use the pygit2 backend, ``requirements.txt`` pins
+the ``libgit2`` dependencies with hashes. Install them with
+``pip install --require-hashes -r requirements.txt``.
 
 Python 3.11 or newer is required
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
