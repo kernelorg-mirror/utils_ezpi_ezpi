@@ -4,6 +4,13 @@ Release notes
 Unreleased
 ----------
 
+Python 3.11 or newer is required
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+ezpi no longer supports Python 3.9 and 3.10. Both have reached their
+end of life, and pygit2 no longer ships wheels for them. ezpi is now
+tested on Python 3.11 to 3.15.
+
 Messages passed as bytes are stored unchanged
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

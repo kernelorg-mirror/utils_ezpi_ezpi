@@ -811,7 +811,7 @@ def should_rotate_epoch(epoch_path: str, mode: str) -> bool:
             except (ValueError, OSError):
                 return False
         try:
-            tz = datetime.timezone.utc
+            tz = datetime.UTC
             commit_year = datetime.datetime.fromtimestamp(timestamp, tz=tz).year
             current_year = datetime.datetime.now(tz=tz).year
             return commit_year < current_year
@@ -1280,7 +1280,7 @@ def save_cursor(
     }
     data = {
         'cursor': cursor_name,
-        'updated': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
+        'updated': datetime.datetime.now(datetime.UTC).isoformat(timespec='seconds'),
         'epochs': epochs,
     }
     _write_cursor(v2path, cursor_name, data)
@@ -1305,7 +1305,7 @@ def _save_cursor_raw(
     """
     data = {
         'cursor': cursor_name,
-        'updated': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
+        'updated': datetime.datetime.now(datetime.UTC).isoformat(timespec='seconds'),
         'epochs': {str(k): v for k, v in per_epoch.items()},
     }
     _write_cursor(v2path, cursor_name, data)

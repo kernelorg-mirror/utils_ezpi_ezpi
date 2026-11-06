@@ -12,7 +12,7 @@ authors = [
     {name = "Konstantin Ryabitsev", email = "mricon@kernel.org"}
 ]
 keywords = ["git", "lore.kernel.org", "public-inbox"]
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 
 [project.urls]
 Homepage = "https://git.kernel.org/pub/scm/utils/ezpi/ezpi.git"
@@ -47,7 +47,7 @@ version = {attr = "ezpi.__VERSION__"}
 
 [tool.ruff]
 line-length = 120
-target-version = "py39"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM"]
@@ -84,8 +84,8 @@ warn_unreachable = true
 # the newest Python that matches `requires-python`, and pinning mypy to an
 # older version causes spurious errors when mypy follows imports into
 # newer stdlib/3rd-party code (e.g. pytest's internal use of `match`).
-# Actual 3.9 compatibility is covered by ci-matrix.sh running the suite on
-# every supported interpreter.
+# Compatibility with the oldest supported Python is covered by ci-matrix.sh
+# running the suite on every supported interpreter.
 # setup.py is a fallback for setuptools < 61; exclude to avoid requiring
 # types-setuptools in the dev environment.
 exclude = ["^setup\\.py$"]

@@ -11,9 +11,9 @@ set -eu
 # Missing interpreters are pulled automatically from uv's managed Python
 # cache (python-build-standalone), so no system packages or sudo are needed.
 #
-# Override the version list: PYTHONS="3.9 3.14" ./ci-matrix.sh
+# Override the version list: PYTHONS="3.11 3.15" ./ci-matrix.sh
 
-PYTHONS="${PYTHONS:-3.9 3.10 3.11 3.12 3.13 3.14}"
+PYTHONS="${PYTHONS:-3.11 3.12 3.13 3.14 3.15}"
 
 # Install any requested interpreters that are missing. This is an explicit
 # step because a dev may have set UV_PYTHON_DOWNLOADS=manual globally to
