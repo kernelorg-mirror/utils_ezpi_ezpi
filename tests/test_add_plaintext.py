@@ -40,7 +40,8 @@ class TestAddPlaintext:
         )
 
         body = get_commit_body(bare_repo)
-        assert b'accents' in body
+        assert b'charset="utf-8"' in body
+        assert 'Caf\u00e9 with \u00e9\u00e8\u00ea accents and \u2014 dash.'.encode() in body
 
     def test_plaintext_with_unicode_author(self, bare_repo: Path) -> None:
         """Test plaintext with Unicode in author name."""

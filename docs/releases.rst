@@ -1,6 +1,35 @@
 Release notes
 =============
 
+Unreleased
+----------
+
+Messages passed as bytes are stored unchanged
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:func:`ezpi.add_rfc822` and :func:`ezpi.add_rfc822_v2` now store a
+message given as ``bytes`` exactly as received. Before, ezpi parsed the
+message and wrote it out again. This transcoded 8-bit bodies in other
+charsets to UTF-8 and added MIME headers, which broke DKIM signatures.
+
+ezpi still makes two changes to ``bytes`` input:
+
+- If ``Date`` or ``Message-Id`` is missing, ezpi adds it at the top of
+  the headers.
+- A leading mbox ``From`` line is dropped.
+
+Line endings are now kept as they are. Before, CRLF line endings were
+changed to LF.
+
+``email.message.Message`` objects work as before: a text payload with
+non-ASCII content or no charset is re-encoded as UTF-8.
+
+Non-ASCII text in add_plaintext()
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:func:`ezpi.add_plaintext` stored non-ASCII characters in the content as
+U+FFFD replacement characters. It now stores them as UTF-8.
+
 .. _release-0.7.0:
 
 v0.7.0

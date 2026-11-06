@@ -408,7 +408,9 @@ def add_plaintext(
         )
     """
     m = f'From: {authorname} <{authoremail}>\nSubject: {subject}\n\n' + content
-    add_rfc822(repo, m.encode(), domain=domain)
+    # Pass a Message, not bytes: add_rfc822() stores bytes as-is, and this
+    # content still needs a charset to be declared for it.
+    add_rfc822(repo, email.message_from_string(m, policy=EMLPOLICY), domain=domain)
 
 
 def clean_header(hdrval: str) -> str:
@@ -454,8 +456,13 @@ def add_rfc822(
 
     - Adds Date header if missing
     - Generates Message-Id if missing
-    - Fixes charset for non-ASCII content
     - Extracts author info from the From header
+
+    Bytes are stored exactly as given, so that DKIM signatures stay valid.
+    The only changes are the missing headers above, which are added at the
+    top, and a leading mbox ``From`` line, which is dropped. A Message
+    object is serialized, and its text payload is re-encoded as UTF-8 when
+    it has non-ASCII content or no charset.
 
     Args:
         repo: Path to the bare git repository.
@@ -481,8 +488,12 @@ def add_rfc822(
         ezpi.add_rfc822('/path/to/repo.git', msg)
     """
     msg: email.message.Message
+    raw: bytes | None = None
     if isinstance(content, bytes):
-        msg = email.message_from_bytes(content, policy=EMLPOLICY)
+        raw = content
+        msg = email.message_from_bytes(raw, policy=EMLPOLICY)
+        if msg.get_unixfrom():
+            raw = raw.partition(b'\n')[2]
     else:
         msg = content
 
@@ -506,29 +517,36 @@ def add_rfc822(
     if not a_name:
         a_name = DEFAULT_NAME
 
+    added: list[tuple[str, str]] = []
     h_date = msg.get('Date')
     if not h_date:
         h_date = formatdate()
-        msg.add_header('Date', h_date)
+        added.append(('Date', h_date))
 
     if not msg.get('Message-Id'):
         msgid = make_msgid(domain=domain)
-        msg.add_header('Message-Id', msgid)
+        added.append(('Message-Id', msgid))
         logger.debug('Added a message-id: %s', msgid)
 
-    # Ensure text messages with non-ASCII content have proper charset set.
-    # This handles cases where external callers pass Message objects with
-    # Unicode content but incorrect/missing charset (e.g., claiming us-ascii).
-    if msg.get_content_maintype() == 'text':
-        payload = msg.get_payload()
-        if isinstance(payload, str) and not payload.isascii():
-            # Re-encode payload as UTF-8 bytes and set proper charset
-            msg.set_payload(payload.encode('utf-8'))
-            msg.set_charset('utf-8')
-        elif not msg.get_content_charset():
-            msg.set_charset('utf-8')
-
-    body = msg.as_bytes(policy=EMLPOLICY)
+    if raw is not None:
+        # Prepend instead of re-serializing: msg.as_bytes() would transcode
+        # 8-bit bodies and refold headers, which breaks DKIM signatures.
+        eol = b'\r\n' if raw.split(b'\n', 1)[0].endswith(b'\r') else b'\n'
+        body = b''.join(f'{name}: {value}'.encode() + eol for name, value in added) + raw
+    else:
+        for name, value in added:
+            msg.add_header(name, value)
+        # Callers build Message objects with Unicode text and a missing or
+        # wrong charset (e.g. claiming us-ascii), which as_bytes() cannot
+        # encode correctly.
+        if msg.get_content_maintype() == 'text':
+            payload = msg.get_payload()
+            if isinstance(payload, str) and not payload.isascii():
+                msg.set_payload(payload.encode('utf-8'))
+                msg.set_charset('utf-8')
+            elif not msg.get_content_charset():
+                msg.set_charset('utf-8')
+        body = msg.as_bytes(policy=EMLPOLICY)
 
     if env is None:
         env = {

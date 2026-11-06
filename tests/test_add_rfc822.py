@@ -35,31 +35,89 @@ This is a test message body.
         assert b'This is a test message body.' in body
         assert b'From: Test User <test@example.com>' in body
 
-    def test_message_without_message_id(self, bare_repo: Path) -> None:
-        """Test that a Message-Id is generated if not present."""
-        msg_bytes = b"""From: Test User <test@example.com>
-Subject: No Message-Id Test
-Date: Mon, 01 Jan 2024 12:00:00 +0000
 
-Body without message-id.
-"""
-        ezpi.add_rfc822(str(bare_repo), msg_bytes, domain='test.example.com')
+class TestAddRfc822BytesPreserved:
+    """Bytes input must be archived exactly as received.
+
+    Archives keep DKIM-Signature headers so messages can be verified
+    later, and any change to the body or signed headers breaks them.
+    Messages written by ezpi should also match what public-inbox-mda
+    stores for the same input.
+    """
+
+    HEADERS = (
+        b'From: Carlos <carlos@example.org>\n'
+        b'Subject: Hola\n'
+        b'Message-Id: <preserve@example.org>\n'
+        b'Date: Mon, 14 Aug 2023 18:01:39 +0200\n'
+    )
+
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            pytest.param(
+                HEADERS + b'MIME-Version: 1.0\n'
+                b'Content-Type: text/plain; charset=iso-8859-1\n'
+                b'Content-Transfer-Encoding: 8bit\n'
+                b'\n'
+                b'Carlos L\xf3pez\n',
+                id='8bit-latin1',
+            ),
+            pytest.param(
+                HEADERS + b'Content-Type: text/plain\n\nplain ascii\n',
+                id='no-charset',
+            ),
+            pytest.param(
+                HEADERS + b'\nno content-type at all\n',
+                id='no-content-type',
+            ),
+            pytest.param(
+                HEADERS.replace(b'\n', b'\r\n') + b'\r\ncrlf line endings\r\n',
+                id='crlf',
+            ),
+        ],
+    )
+    def test_stored_byte_identical(self, bare_repo: Path, raw: bytes) -> None:
+        """Complete messages are stored without any changes."""
+        ezpi.add_rfc822(str(bare_repo), raw)
+
+        assert get_commit_body(bare_repo) == raw
+
+    @pytest.mark.parametrize(
+        ('drop', 'added'),
+        [
+            (b'Date: Mon, 14 Aug 2023 18:01:39 +0200\n', b'Date: '),
+            (b'Message-Id: <preserve@example.org>\n', b'Message-Id: <'),
+        ],
+    )
+    @pytest.mark.parametrize('eol', [b'\n', b'\r\n'])
+    def test_missing_header_is_prepended(self, bare_repo: Path, drop: bytes, added: bytes, eol: bytes) -> None:
+        """Missing Date or Message-Id is added without touching the rest.
+
+        public-inbox needs both headers, but adding them must not
+        re-serialize the message. The new header uses the message's own
+        line ending, so the result does not mix LF and CRLF.
+        """
+        raw = (self.HEADERS.replace(drop, b'') + b'\nCarlos L\xf3pez\n').replace(b'\n', eol)
+
+        ezpi.add_rfc822(str(bare_repo), raw, domain='example.org')
 
         body = get_commit_body(bare_repo)
-        assert b'Message-Id:' in body or b'Message-ID:' in body
+        first, rest = body.split(eol, 1)
+        assert first.startswith(added)
+        assert rest == raw
 
-    def test_message_without_date(self, bare_repo: Path) -> None:
-        """Test that a Date is generated if not present."""
-        msg_bytes = b"""From: Test User <test@example.com>
-Subject: No Date Test
-Message-Id: <nodate@example.com>
+    def test_mbox_from_line_is_dropped(self, bare_repo: Path) -> None:
+        """The mbox envelope line is not part of the message.
 
-Body without date.
-"""
-        ezpi.add_rfc822(str(bare_repo), msg_bytes)
+        Callers often pass messages split from an mbox file. public-inbox
+        does not store the envelope line either.
+        """
+        raw = self.HEADERS + b'\nbody\n'
 
-        body = get_commit_body(bare_repo)
-        assert b'Date:' in body
+        ezpi.add_rfc822(str(bare_repo), b'From carlos@example.org Mon Aug 14 18:01:39 2023\n' + raw)
+
+        assert get_commit_body(bare_repo) == raw
 
 
 class TestAddRfc822WithMessage:
@@ -134,51 +192,28 @@ class TestAddRfc822Unicode:
         assert b'non' in body
         assert b'breaking hyphen' in body
 
-    def test_message_with_unicode_payload_no_charset(self, bare_repo: Path) -> None:
-        """Test Message with Unicode payload but no charset set.
+    @pytest.mark.parametrize('content_type', [None, 'text/plain; charset=us-ascii'])
+    def test_message_unicode_payload_gets_utf8_charset(self, bare_repo: Path, content_type: str | None) -> None:
+        """Message objects with Unicode payloads are re-encoded as UTF-8.
 
-        This reproduces the original bug where a Message object is passed
-        with Unicode content but without proper Content-Type/charset,
-        causing UnicodeEncodeError in as_bytes().
+        Callers such as groupsio-webhook.py build messages with Unicode
+        text and either no charset or a wrong one. Without the fix-up,
+        as_bytes() raises UnicodeEncodeError or writes a wrong charset.
         """
-        # Create message without using set_content() - simulates messages
-        # that might come from other sources without proper encoding
         msg = email.message.Message()
         msg['From'] = 'Test User <test@example.com>'
         msg['Subject'] = 'Unicode Payload Test'
         msg['Message-Id'] = '<unicode-payload@example.com>'
         msg['Date'] = 'Mon, 01 Jan 2024 12:00:00 +0000'
-        # Set payload directly with Unicode - this is what causes the issue
+        if content_type:
+            msg['Content-Type'] = content_type
         msg.set_payload('Content with non\u2011breaking hyphen and \u00e9 accent.')
 
         ezpi.add_rfc822(str(bare_repo), msg)
 
         body = get_commit_body(bare_repo)
-        assert b'Content with non' in body
-
-    def test_message_claims_ascii_but_has_unicode(self, bare_repo: Path) -> None:
-        """Test Message that claims us-ascii but contains Unicode.
-
-        This tests the case where an external caller passes a Message
-        with Content-Type claiming us-ascii but payload has Unicode chars.
-        The fix should correct the charset to utf-8.
-        """
-        msg = email.message.Message()
-        msg['From'] = 'Test User <test@example.com>'
-        msg['Subject'] = 'Lying ASCII Test'
-        msg['Message-Id'] = '<lying-ascii@example.com>'
-        msg['Date'] = 'Mon, 01 Jan 2024 12:00:00 +0000'
-        msg['Content-Type'] = 'text/plain; charset=us-ascii'
-        # Set payload with Unicode despite claiming ASCII
-        msg.set_payload('This claims ASCII but has \u2011 and \u00e9 chars.')
-
-        ezpi.add_rfc822(str(bare_repo), msg)
-
-        body = get_commit_body(bare_repo)
-        assert b'This claims ASCII' in body
-        # Verify charset was corrected to utf-8
-        assert b'charset=' in body.lower()
-        assert b'utf-8' in body.lower() or b'utf8' in body.lower()
+        assert b'charset="utf-8"' in body
+        assert 'non\u2011breaking hyphen and \u00e9 accent'.encode() in body
 
     def test_message_with_various_unicode(self, bare_repo: Path) -> None:
         """Test that messages with various Unicode characters are handled."""
